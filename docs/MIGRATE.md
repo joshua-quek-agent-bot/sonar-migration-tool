@@ -5,13 +5,15 @@
 > - Want the same multi-phase workflow but with prompts instead of typing each command? Use the **`wizard`** command — interactive and guided.
 > - Want full control over each phase, multiple SonarQube Server instances, or to inspect / edit the mapping CSVs before pushing? You're in the right place — keep reading.
 
-The `migrate` command is the **final phase** of a six-phase pipeline. You run it together with the underlying `extract`, `structure`, and `mappings` commands to move configuration from one or more SonarQube Server instances into SonarQube Cloud. Use it when you need:
+`migrate` is a **single-command path** that chains the full pipeline (extract → structure → mappings → migrate) and finishes by writing a PDF summary. It's the right choice when you need:
 
-- To migrate **many** projects from one or more SonarQube Server instances.
-- To review and edit the per-entity mapping CSVs (`gates.csv`, `profiles.csv`, `groups.csv`, `templates.csv`, `portfolios.csv`) before pushing to SonarQube Cloud.
+- To migrate **many** projects from a SonarQube Server instance.
+- To review and edit `organizations.csv` and the per-entity mapping CSVs (`gates.csv`, `profiles.csv`, `groups.csv`, `templates.csv`, `portfolios.csv`) before pushing to SonarQube Cloud.
 - To resume a failed migration from the last completed task without redoing successful work.
 - To audit intermediate files for compliance or change management.
-- To script the phases independently in CI/CD pipelines.
+- To target multiple SonarQube Cloud organizations in a single run (multi-org mode).
+
+The underlying `extract`, `structure`, and `mappings` commands are still available if you need to script the phases independently in CI/CD pipelines.
 
 ---
 
@@ -85,71 +87,68 @@ For deeper config reference, see [CONFIG.md](CONFIG.md).
 
 All examples show both forms. Use whichever matches your setup:
 
-- **From source:** `cd go && go run . <command> [args]`
-- **Built binary:** `sonar-migration-tool <command> [args]`
+- **From source:** `cd go && go run . migrate [args]`
+- **Built binary:** `sonar-migration-tool migrate [args]`
 
-> The default `--export_directory` is `./migration-files` (created in the current working directory). You can override it with the `--export_directory` flag or the `export_directory` field in the JSON config. Every command prints `See sonar-migration-tool output results in <directory>` when it finishes.
+> The default `--export_directory` is `./migration-files` (created in the current working directory). You can override it with the `--export_directory` flag. Every command prints `See sonar-migration-tool output results in <directory>` when it finishes.
 
-### Step 1 — Create a working directory
+### Step 1 — Write a unified config file
 
-```bash
-mkdir sonar-migration && cd sonar-migration
-mkdir files
+Create a `config.json` with the unified shape (one `sonarqube` block, one `sonarcloud` block). See [CONFIG.md](CONFIG.md) for the full reference.
+
+Single-org migration:
+
+```json
+{
+  "sonarqube":  { "url": "https://sonarqube.example.com", "token": "sqp_xxx" },
+  "sonarcloud": { "token": "squ_xxx", "organization": "my-org" }
+}
 ```
 
-All subsequent commands assume you are running from inside this directory.
+Multi-org migration (one SQS Server → many SonarQube Cloud orgs):
 
-### Step 2 — Extract
-
-Connect to SonarQube Server and export all the data needed for migration.
-
-```bash
-# From source
-go run . extract <URL> <TOKEN> --export_directory ./files/ [--concurrency 25] [--timeout 60]
-
-# Built binary
-sonar-migration-tool extract <URL> <TOKEN> --export_directory ./files/ [--concurrency 25] [--timeout 60]
+```json
+{
+  "sonarqube":  { "url": "https://sonarqube.example.com", "token": "sqp_xxx" },
+  "sonarcloud": {
+    "organizations": [
+      { "key": "org-a", "token": "squ_aaa" },
+      { "key": "org-b", "token": "squ_bbb" }
+    ]
+  }
+}
 ```
 
-| Flag | Description |
-|---|---|
-| `--config` | Path to a JSON configuration file (see [CONFIG.md](CONFIG.md)) |
-| `--extract_id` | Resume a previous extraction by its ID |
-| `--target_task` | Run a specific task (with its dependencies) |
-| `--concurrency` | Max concurrent requests (default: server-detected) |
-| `--timeout` | Request timeout in seconds |
-| `--extract_type` | Type of extract to run |
-| `--export_directory` | Output directory (default: `./migration-files`) |
-| `--include_scan_history` | Extract full issue data, source code, and SCM blame for scan history import |
-| `--pem_file_path` | Client certificate PEM file (mTLS) |
-| `--key_file_path` | Client certificate key file (mTLS) |
-| `--cert_password` | Client certificate password (mTLS) |
-
-For multiple servers, run `extract` once per server — `structure` aggregates the results.
-
-### Step 3 — Structure
-
-Reads the extracted data and generates an `organizations.csv` file.
+### Step 2 — Run `migrate` (first pass)
 
 ```bash
 # From source
-go run . structure --export_directory ./files/
+go run . migrate --config config.json --export_directory ./files/
 
 # Built binary
-sonar-migration-tool structure --export_directory ./files/
-
-# Or reuse the extract config (export_directory is read from it)
-sonar-migration-tool structure --config extract-config.json
+sonar-migration-tool migrate --config config.json --export_directory ./files/
 ```
 
-| Flag | Description |
-|---|---|
-| `--export_directory` | Root directory containing the extract output (default: `./migration-files`) |
-| `--config` | Path to a JSON config file (same shape as `extract --config`). `export_directory` is read from it; when exactly one SonarCloud organization is defined, its key pre-populates `sonarcloud_org_key`. `--export_directory` on the CLI overrides the config value. |
+The command runs the first two phases automatically:
 
-### Step 4 — Edit `organizations.csv`
+```
+[1/4] Extracting from SonarQube Server...
+[2/4] Building organization structure...
+```
 
-Open `files/organizations.csv` in any spreadsheet editor or text editor. Fill in the `sonarcloud_org_key` column with the key of the SonarQube Cloud organization where each group of projects should be migrated.
+After phase 2, the tool writes `files/organizations.csv` and exits with a clear message:
+
+```
+Error: organizations.csv has N row(s) without sonarcloud_org_key.
+Edit ./files/organizations.csv to set the target SonarQube Cloud organization
+for each row, then re-run migrate to continue.
+```
+
+This is the "human step" — see [SPEC-018 in the roadmap](../roadmap/specs/SPEC-018-multi-org-mapping.md) for why it exists and how CloudVoyager handles it the same way.
+
+### Step 3 — Edit `organizations.csv`
+
+Open `files/organizations.csv` in any spreadsheet or text editor. Fill in the `sonarcloud_org_key` column for every row. Save the file.
 
 Example:
 
@@ -158,63 +157,58 @@ server_url,sonarcloud_org_key
 http://localhost:9000,my-cloud-org-key
 ```
 
-Save the file when you are done.
-
-> **Shortcut for single-org migrations:** if every project on every server is going to land in the same SonarQube Cloud organization, you can skip this step and pass `--default_organization <org-key>` (or set `target.default_organization` in the config file) when running `migrate` in Step 6. The tool fills `sonarcloud_org_key` for every row in `organizations.csv` automatically. If you have already mapped any row by hand, the flag is ignored and a `WARN` is logged. (Issue #281.)
-
-### Step 5 — Mappings
-
-Generates the per-entity mapping CSVs (gates, profiles, groups, templates, portfolios).
+### Step 4 — Re-run `migrate` (second pass)
 
 ```bash
 # From source
-go run . mappings --export_directory ./files/
+go run . migrate --config config.json --export_directory ./files/
 
 # Built binary
-sonar-migration-tool mappings --export_directory ./files/
-
-# Or reuse the extract config
-sonar-migration-tool mappings --config extract-config.json
+sonar-migration-tool migrate --config config.json --export_directory ./files/
 ```
 
-| Flag | Description |
-|---|---|
-| `--export_directory` | Root directory containing the extract output (default: `./migration-files`) |
-| `--config` | Path to JSON config file (same shape as `extract --config`); `export_directory` is read from it. `--export_directory` on the CLI overrides the config value. |
+The tool detects that `organizations.csv` is fully populated and picks up from the Mappings phase:
 
-This produces:
+```
+[3/4] Generating entity mappings...
+[4/4] Migrating to SonarQube Cloud...
+PDF summary report: ./files/<run-id>/migration_summary.pdf
+```
 
-- `gates.csv` — Quality Gate mappings
-- `profiles.csv` — Quality Profile mappings
-- `groups.csv` — Group mappings
-- `templates.csv` — Permission Template mappings
-- `portfolios.csv` — Portfolio mappings
+### CLI-only (no config file)
 
-You can review or edit any of these before proceeding.
-
-### Step 6 — Migrate
-
-Push everything to SonarQube Cloud. You'll need your SonarQube Cloud admin token and enterprise key.
+If you'd rather skip the JSON file, every field can be supplied on the command line:
 
 ```bash
-# From source
-go run . migrate <TOKEN> <ENTERPRISE_KEY> --export_directory ./files/ [--run_id <id>] [--skip_profiles]
-
-# Built binary
-sonar-migration-tool migrate <TOKEN> <ENTERPRISE_KEY> --export_directory ./files/ [--run_id <id>] [--skip_profiles]
+sonar-migration-tool migrate \
+  --sq-url https://sonarqube.example.com \
+  --sq-token sqp_xxx \
+  --sc-token squ_xxx \
+  --sc-org my-org
 ```
+
+### Flags
 
 | Flag | Description |
 |---|---|
-| `--config` | Path to a JSON configuration file |
-| `--run_id` | Resume a failed migration from the last completed task |
-| `--target_task` | Run a specific migration task (with its dependencies) |
-| `--skip_profiles` | Skip quality profile migration/provisioning |
-| `--default_organization` | SonarQube Cloud organization key applied to every project when `organizations.csv` has no mapping. Ignored (with a WARN) if any row already carries a `sonarcloud_org_key`. Useful for small instances where every SQS project migrates into one SQC org. |
+| `--config` | Path to a unified JSON configuration file |
+| `--sq-url` | SonarQube Server URL |
+| `--sq-token` | SonarQube Server token |
+| `--sq-project-key` | Scope extraction to a single SonarQube Server project key |
+| `--sc-url` | SonarQube Cloud URL (default: `https://sonarcloud.io/`) |
+| `--sc-token` | SonarQube Cloud token (single-org mode) |
+| `--sc-org` | SonarQube Cloud organization key (single-org mode) |
+| `--sc-enterprise-key` | SonarQube Cloud enterprise key (defaults to `--sc-org`) |
 | `--edition` | SonarQube Cloud license edition |
-| `--url` | SonarQube Cloud URL (default: `https://sonarcloud.io/`) |
+| `--url` | Alias for `--sc-url` (legacy) |
+| `--run_id` | Resume an in-progress migration by run ID |
+| `--target_task` | Run a specific migration task (with its dependencies) |
+| `--export_directory` | Working directory for intermediate files (default: `./migration-files`) |
+| `--default_organization` | SonarQube Cloud organization applied to every project when `organizations.csv` has no mapping |
 | `--concurrency` | Max concurrent requests |
-| `--export_directory` | Directory containing SonarQube exports (default: `./migration-files`) |
+| `--skip_profiles` | Skip quality profile migration/provisioning |
+| `--include_scan_history` | Extract and import full issue/hotspot scan history |
+| `--debug` | Enable debug-level logging (verbose request payloads) |
 
 ---
 

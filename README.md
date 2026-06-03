@@ -101,17 +101,26 @@ Full reference, more examples, and the config-file format:
 ### Migrating many projects (or many SonarQube Server instances)
 <!-- updated: 2026-06-04_01:13:00.000 by Claude -->
 
-Use `migrate` together with the underlying `extract` / `structure` / `mappings` commands. This gives you a chance to review and edit the mapping CSVs between phases — useful when projects need to land in different SonarQube Cloud organizations, or when you want to re-run individual steps after a failure.
+Use `migrate`. It runs the full pipeline in a single command — extracting from SonarQube Server, generating the per-entity mapping CSVs, and pushing everything to SonarQube Cloud — and finishes by writing a PDF summary.
 
 ```bash
-./sonar-migration-tool extract <SQ_URL> <SQ_TOKEN>
-# → edit organizations.csv to set sonarcloud_org_key per row
-./sonar-migration-tool structure
-./sonar-migration-tool mappings
-./sonar-migration-tool migrate <SC_TOKEN> <SC_ENTERPRISE_KEY>
+./sonar-migration-tool migrate --config config.json
 ```
 
-Full reference, flags, multi-server migration, and resume support:
+The config file uses the unified shape (one `sonarqube` block, one `sonarcloud` block):
+
+```json
+{
+  "sonarqube":  { "url": "https://sonarqube.example.com", "token": "sqp_xxx" },
+  "sonarcloud": { "token": "squ_xxx", "organization": "my-org" }
+}
+```
+
+After the Structure phase, the tool writes `organizations.csv` and asks you to fill in the target SonarQube Cloud organization key for each row. Re-run `migrate` with the same `--export_directory` to continue from the Mappings phase.
+
+If you only have a few projects and don't need to review the mapping CSVs, the underlying `extract` / `structure` / `mappings` commands are still available for advanced workflows.
+
+Full reference, flag table, multi-org migration, and resume support:
 👉 **[Using `migrate` — Migrate All Projects](docs/MIGRATE.md)**
 
 ### Want a guided experience?

@@ -1,0 +1,13 @@
+{
+  "sonarqube": {
+    "url":   "https://sonarqube.example.com",
+    "token": "sqp_your_sonarqube_token_here",
+    "projectKey": ""
+  },
+  "sonarcloud": {
+    "url":           "https://sonarcloud.io/",
+    "token":         "squ_your_sonarcloud_token_here",
+    "organization":  "your-org-key",
+    "enterpriseKey": "your-enterprise-key"
+  }
+}
