@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/sonar-solutions/sonar-migration-tool/internal/common"
@@ -119,19 +120,59 @@ func matchHotspots(sources, clouds []matchableHotspot, sourceProject, cloudProje
 // Resolution mapping
 // ---------------------------------------------------------------------------
 
-// mapHotspotResolution converts a SonarQube Server hotspot resolution into
-// the equivalent SonarQube Cloud resolution value.
-// ACKNOWLEDGED does not exist in SonarCloud; the closest equivalent is SAFE.
-func mapHotspotResolution(resolution string) string {
+// hotspotResolutionResult is the outcome of mapping a SonarQube Server
+// hotspot resolution onto a SonarQube Cloud resolution.
+//
+// Mapped is the value we will post to Cloud via ChangeStatus. The
+// Acknowledged / Unknown flags let the caller log a warning and surface
+// the count in the migration report instead of silently downgrading the
+// resolution — see issue #323 (CLOUDVOYAGER-DELTA BUG-07).
+type hotspotResolutionResult struct {
+	// Mapped is the Cloud resolution value to post. "" means
+	// ChangeStatus should be called without a resolution parameter,
+	// which is the safest behaviour for a value we don't recognise.
+	Mapped string
+
+	// Acknowledged is true when the source resolution was ACKNOWLEDGED,
+	// which SonarCloud does not support. The closest supported
+	// resolution is SAFE, which we use as the Mapped value, but the
+	// flag lets the caller record the fidelity loss.
+	Acknowledged bool
+
+	// Unknown is true when the source resolution was empty, lowercased
+	// garbage, or a value not in the recognised set. The previous
+	// implementation silently returned SAFE for every unknown value,
+	// which made it impossible to tell ACKNOWLEDGED-apart-from-SAFE
+	// from "user typo" or "future SQS resolution". With Unknown set,
+	// the caller can log a warning and let a human investigate.
+	Unknown bool
+}
+
+// mapHotspotResolution converts a SonarQube Server hotspot resolution
+// into the equivalent SonarQube Cloud resolution value.
+//
+// ACKNOWLEDGED has no direct equivalent in SonarCloud; we map it to
+// SAFE and set Acknowledged=true so the caller can surface the
+// downgrade in the migration report. Reference:
+// https://docs.sonarsource.com/sonarqube-cloud/using-sonarqube-cloud/reviewing-security-hotspots/
+// (SonarCloud hotspot resolutions are SAFE, FIXED, or "no resolution"
+// for TO_REVIEW — see the hotspot change_status endpoint.)
+//
+// Truly unknown values return Mapped="" so we don't fabricate a SAFE
+// value and silently lose the source signal.
+func mapHotspotResolution(resolution string) hotspotResolutionResult {
 	switch strings.ToUpper(resolution) {
 	case "SAFE":
-		return "SAFE"
+		return hotspotResolutionResult{Mapped: "SAFE"}
 	case "FIXED":
-		return "FIXED"
+		return hotspotResolutionResult{Mapped: "FIXED"}
 	case "ACKNOWLEDGED":
-		return "SAFE"
+		// SonarCloud does not have an ACKNOWLEDGED resolution; SAFE
+		// is the closest supported value. We still flag it so the
+		// migration report can list it as an expected fidelity loss.
+		return hotspotResolutionResult{Mapped: "SAFE", Acknowledged: true}
 	default:
-		return "SAFE"
+		return hotspotResolutionResult{Unknown: true}
 	}
 }
 
@@ -166,11 +207,13 @@ func runSyncHotspotMetadata(ctx context.Context, e *Executor) error {
 			}
 
 			record, _ := json.Marshal(map[string]any{
-				"cloud_project_key": cloudKey,
-				"synced":            result.Synced,
-				"skipped":           result.Skipped,
-				"failed":            result.Failed,
-				"error":             result.Error,
+				"cloud_project_key":      cloudKey,
+				"synced":                 result.Synced,
+				"skipped":                result.Skipped,
+				"failed":                 result.Failed,
+				"acknowledged_downgrade": result.Acknowledged,
+				"unknown_resolution":     result.UnknownResolution,
+				"error":                  result.Error,
 			})
 			return w.WriteOne(record)
 		})
@@ -188,10 +231,12 @@ type syncHotspotInput struct {
 }
 
 type syncHotspotResult struct {
-	Synced  int64
-	Skipped int64
-	Failed  int64
-	Error   string
+	Synced            int64
+	Skipped           int64
+	Failed            int64
+	Acknowledged      int64 // count of hotspots whose source resolution was ACKNOWLEDGED (downgraded to SAFE)
+	UnknownResolution int64 // count of hotspots whose source resolution was empty or unrecognised
+	Error             string
 }
 
 // syncProjectHotspots synchronises hotspot metadata for a single project.
@@ -213,13 +258,17 @@ func syncProjectHotspots(ctx context.Context, e *Executor, input syncHotspotInpu
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(cap(e.Sem))
 
+	// Atomic counters for fidelity-loss tracking (issue #323). Shared across
+	// goroutines; loaded into syncHotspotResult after the loop.
+	var acknowledged, unknownRes atomic.Int64
+
 	for i := range matchedPairs {
 		pair := matchedPairs[i]
 		g.Go(func() error {
 			if gctx.Err() != nil {
 				return nil
 			}
-			if err := syncOneHotspot(gctx, e, pair); err != nil {
+			if err := syncOneHotspot(gctx, e, pair, &acknowledged, &unknownRes); err != nil {
 				counter.Fail()
 				logAPIWarn(e.Logger, "syncHotspotMetadata: hotspot sync failed", err,
 					"source_key", pair.source.Key, "cloud_key", pair.cloud.Key)
@@ -232,9 +281,11 @@ func syncProjectHotspots(ctx context.Context, e *Executor, input syncHotspotInpu
 	g.Wait() //nolint:errcheck // goroutines always return nil; errors are per-pair
 
 	return syncHotspotResult{
-		Synced:  counter.succeeded.Load(),
-		Skipped: int64(allCount - len(matchedPairs)),
-		Failed:  counter.failed.Load(),
+		Synced:            counter.succeeded.Load(),
+		Skipped:           int64(allCount - len(matchedPairs)),
+		Failed:            counter.failed.Load(),
+		Acknowledged:      acknowledged.Load(),
+		UnknownResolution: unknownRes.Load(),
 	}, nil
 }
 
@@ -293,11 +344,31 @@ func buildHotspotPairs(ctx context.Context, e *Executor, input syncHotspotInput)
 
 // syncOneHotspot synchronises a single hotspot's status and comments.
 // Operations are sequential within each hotspot: status first, then comments.
-func syncOneHotspot(ctx context.Context, e *Executor, pair hotspotPair) error {
+//
+// The acknowledged and unknownRes counters are passed in by the caller so
+// that the migration report can list fidelity losses (e.g. ACKNOWLEDGED
+// hotspots downgraded to SAFE) and resolution-mapping gaps (e.g. an
+// unrecognised future SQS resolution). They are atomic because
+// syncOneHotspot is invoked from many goroutines.
+func syncOneHotspot(ctx context.Context, e *Executor, pair hotspotPair, acknowledged, unknownRes *atomic.Int64) error {
 	// 1. Sync status: if source is REVIEWED, change Cloud hotspot status.
 	if strings.ToUpper(pair.source.Status) == "REVIEWED" {
-		resolution := mapHotspotResolution(pair.source.Resolution)
-		if err := e.Cloud.Hotspots.ChangeStatus(ctx, pair.cloud.Key, "REVIEWED", resolution); err != nil {
+		res := mapHotspotResolution(pair.source.Resolution)
+		if res.Acknowledged {
+			acknowledged.Add(1)
+			e.Logger.Warn("syncHotspotMetadata: ACKNOWLEDGED hotspot downgraded to SAFE — SonarCloud has no ACKNOWLEDGED resolution",
+				"source_key", pair.source.Key,
+				"cloud_key", pair.cloud.Key,
+				"source_resolution", pair.source.Resolution)
+		}
+		if res.Unknown {
+			unknownRes.Add(1)
+			e.Logger.Warn("syncHotspotMetadata: unrecognised hotspot resolution; posting without a resolution value",
+				"source_key", pair.source.Key,
+				"cloud_key", pair.cloud.Key,
+				"source_resolution", pair.source.Resolution)
+		}
+		if err := e.Cloud.Hotspots.ChangeStatus(ctx, pair.cloud.Key, "REVIEWED", res.Mapped); err != nil {
 			return fmt.Errorf("change status: %w", err)
 		}
 	}

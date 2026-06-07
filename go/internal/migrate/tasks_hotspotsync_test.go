@@ -64,12 +64,68 @@ func TestFilterActionableHotspotPairs(t *testing.T) {
 			wantActionable: 2,
 		},
 	}
-
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			got := filterActionableHotspotPairs(tc.pairs)
 			if len(got) != tc.wantActionable {
 				t.Errorf("filterActionableHotspotPairs() returned %d pairs, want %d", len(got), tc.wantActionable)
+			}
+		})
+	}
+}
+
+func TestMapHotspotResolution(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want hotspotResolutionResult
+	}{
+		{
+			name: "SAFE maps to SAFE",
+			in:   "SAFE",
+			want: hotspotResolutionResult{Mapped: "SAFE"},
+		},
+		{
+			name: "FIXED maps to FIXED",
+			in:   "FIXED",
+			want: hotspotResolutionResult{Mapped: "FIXED"},
+		},
+		{
+			name: "ACKNOWLEDGED downgrades to SAFE with flag",
+			in:   "ACKNOWLEDGED",
+			want: hotspotResolutionResult{Mapped: "SAFE", Acknowledged: true},
+		},
+		{
+			name: "lowercase acknowledged still recognised",
+			in:   "acknowledged",
+			want: hotspotResolutionResult{Mapped: "SAFE", Acknowledged: true},
+		},
+		{
+			name: "mixed case acknowledged still recognised",
+			in:   "Acknowledged",
+			want: hotspotResolutionResult{Mapped: "SAFE", Acknowledged: true},
+		},
+		{
+			name: "empty string is unknown",
+			in:   "",
+			want: hotspotResolutionResult{Unknown: true},
+		},
+		{
+			name: "garbage is unknown",
+			in:   "garbage",
+			want: hotspotResolutionResult{Unknown: true},
+		},
+		{
+			name: "future SQS resolution is unknown",
+			in:   "WONTFIX",
+			want: hotspotResolutionResult{Unknown: true},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mapHotspotResolution(tc.in)
+			if got != tc.want {
+				t.Errorf("mapHotspotResolution(%q) = %+v, want %+v", tc.in, got, tc.want)
 			}
 		})
 	}
