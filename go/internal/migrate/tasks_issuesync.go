@@ -157,7 +157,14 @@ func getFallbackTransition(resolution, status string) string {
 	case "RESOLVED", "CLOSED":
 		return "resolve"
 	case "ACCEPTED":
-		return "wontfix"
+		// SonarCloud supports the "accept" transition per SPEC-008 (Clean as You Code /
+		// MQR model). The previous "wontfix" mapping collapsed the distinct ACCEPTED
+		// triaged-by-engineer state into a "won't fix" decision. See issue #322.
+		// If a target Cloud issue's available transitions do not include "accept"
+		// (e.g. on legacy Standard mode issues), the executor will log a warning and
+		// isExpectedTransitionError will treat the 400 as non-fatal — the issue will
+		// simply remain on its current Cloud status.
+		return "accept"
 	case "FALSE_POSITIVE":
 		return "falsepositive"
 	case "IN_SANDBOX":
@@ -518,10 +525,15 @@ func loadMatchableIssues(e *Executor, serverURL, serverKey string) []matchableIs
 		status := strings.ToUpper(extractField(item.Data, "status"))
 		resolution := strings.ToUpper(extractField(item.Data, "resolution"))
 
-		// Exclude CLOSED and FIXED — these won't exist in Cloud.
+		// Exclude CLOSED — these won't exist in Cloud.
 		if status == "CLOSED" {
 			continue
 		}
+		// Exclude FIXED at load stage (issue #322): the Cloud scan report
+		// does not reproduce already-fixed issues, so they have no Cloud
+		// counterpart to transition. A future enhancement could fetch the
+		// historical issue list from Cloud and replay FIXED → resolve,
+		// but the current scan-based sync cannot reach those issues.
 		if resolution == "FIXED" {
 			continue
 		}
