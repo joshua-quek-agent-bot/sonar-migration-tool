@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestEditionParsing(t *testing.T) {
@@ -72,6 +73,83 @@ func TestExtractBool(t *testing.T) {
 	}
 	if ExtractBool(raw, "missing") {
 		t.Error("expected false for missing key")
+	}
+}
+
+func TestExtractStringMap(t *testing.T) {
+	// Sonar's typical /api/rules/search params shape.
+	raw := json.RawMessage(`{"params":[{"key":"format","value":"google"},{"key":"max","value":"120"}]}`)
+	got := ExtractStringMap(raw, "params")
+	want := map[string]string{"format": "google", "max": "120"}
+	if len(got) != len(want) {
+		t.Fatalf("len: got %d, want %d", len(got), len(want))
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("params[%q]: got %q, want %q", k, got[k], v)
+		}
+	}
+	// Missing key returns an empty (non-nil) map.
+	if got := ExtractStringMap(json.RawMessage(`{"other":1}`), "params"); len(got) != 0 {
+		t.Errorf("expected empty map for missing key, got %v", got)
+	}
+	// Malformed payload returns an empty map.
+	if got := ExtractStringMap(json.RawMessage(`{"params":"not-an-array"}`), "params"); len(got) != 0 {
+		t.Errorf("expected empty map for malformed payload, got %v", got)
+	}
+}
+
+func TestExtractImpacts(t *testing.T) {
+	raw := json.RawMessage(`{"impacts":[{"softwareQuality":"MAINTAINABILITY","severity":"HIGH"},{"softwareQuality":"RELIABILITY","severity":"MEDIUM"}]}`)
+	got := ExtractImpacts(raw, "impacts")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 impacts, got %d", len(got))
+	}
+	if got[0].SoftwareQuality != "MAINTAINABILITY" || got[0].Severity != "HIGH" {
+		t.Errorf("impact[0]: got %+v", got[0])
+	}
+	if got[1].SoftwareQuality != "RELIABILITY" || got[1].Severity != "MEDIUM" {
+		t.Errorf("impact[1]: got %+v", got[1])
+	}
+	if got := ExtractImpacts(json.RawMessage(`{}`), "impacts"); got != nil {
+		t.Errorf("expected nil for missing key, got %v", got)
+	}
+}
+
+func TestExtractTime(t *testing.T) {
+	// Sonar's typical format: no colon in timezone offset.
+	raw := json.RawMessage(`{"createdAt":"2024-01-15T10:00:00+0000","updatedAt":"2024-02-20T14:30:00.000+0000","rfc":"2024-03-10T08:00:00Z"}`)
+	wantCreated, _ := time.Parse(time.RFC3339, "2024-01-15T10:00:00Z")
+	if got := ExtractTime(raw, "createdAt"); !got.Equal(wantCreated) {
+		t.Errorf("createdAt: got %v, want %v", got, wantCreated)
+	}
+	wantUpdated, _ := time.Parse(time.RFC3339, "2024-02-20T14:30:00Z")
+	if got := ExtractTime(raw, "updatedAt"); !got.Equal(wantUpdated) {
+		t.Errorf("updatedAt: got %v, want %v", got, wantUpdated)
+	}
+	wantRFC, _ := time.Parse(time.RFC3339, "2024-03-10T08:00:00Z")
+	if got := ExtractTime(raw, "rfc"); !got.Equal(wantRFC) {
+		t.Errorf("rfc: got %v, want %v", got, wantRFC)
+	}
+	// Epoch millis.
+	rawMs := json.RawMessage(`{"t":1700000000000}`)
+	wantMs := time.UnixMilli(1700000000000).UTC()
+	if got := ExtractTime(rawMs, "t"); !got.Equal(wantMs) {
+		t.Errorf("epoch ms: got %v, want %v", got, wantMs)
+	}
+	// Epoch seconds.
+	rawS := json.RawMessage(`{"t":1700000000}`)
+	wantS := time.Unix(1700000000, 0).UTC()
+	if got := ExtractTime(rawS, "t"); !got.Equal(wantS) {
+		t.Errorf("epoch s: got %v, want %v", got, wantS)
+	}
+	// Missing key.
+	if got := ExtractTime(json.RawMessage(`{}`), "missing"); !got.IsZero() {
+		t.Errorf("expected zero time for missing key, got %v", got)
+	}
+	// Invalid string.
+	if got := ExtractTime(json.RawMessage(`{"t":"not-a-date"}`), "t"); !got.IsZero() {
+		t.Errorf("expected zero time for invalid date, got %v", got)
 	}
 }
 
@@ -171,7 +249,7 @@ type testTaskDef struct {
 	deps []string
 }
 
-func (t *testTaskDef) TaskName() string      { return t.name }
+func (t *testTaskDef) TaskName() string        { return t.name }
 func (t *testTaskDef) TaskEditions() []Edition { return t.eds }
 func (t *testTaskDef) TaskDeps() []string      { return t.deps }
 

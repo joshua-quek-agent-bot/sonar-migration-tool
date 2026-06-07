@@ -430,25 +430,25 @@ func classifyExternalIssue(data json.RawMessage) (scanreport.ExternalIssueInput,
 	}
 	engineID := strings.TrimPrefix(repo, "external_")
 	return scanreport.ExternalIssueInput{
-		EngineID:     engineID,
-		RuleID:       key,
-		Message:      extractField(data, "message"),
-		Severity:     extractField(data, "severity"),
-		Type:         extractField(data, "type"),
-		StartLine:    extractInt32(data, "textRange", "startLine"),
-		EndLine:      extractInt32(data, "textRange", "endLine"),
-		StartOff:     extractInt32(data, "textRange", "startOffset"),
-		EndOff:       extractInt32(data, "textRange", "endOffset"),
-		Component:    extractField(data, "component"),
-		CreationDate: parseISODate(extractField(data, "creationDate")),
-	}, scanreport.AdHocRuleInput{
-		EngineID:    engineID,
-		RuleID:      key,
-		Name:        key,
-		Description: fmt.Sprintf("Rule from %s plugin", engineID),
-		Severity:    extractField(data, "severity"),
-		Type:        extractField(data, "type"),
-	}, true
+			EngineID:     engineID,
+			RuleID:       key,
+			Message:      extractField(data, "message"),
+			Severity:     extractField(data, "severity"),
+			Type:         extractField(data, "type"),
+			StartLine:    extractInt32(data, "textRange", "startLine"),
+			EndLine:      extractInt32(data, "textRange", "endLine"),
+			StartOff:     extractInt32(data, "textRange", "startOffset"),
+			EndOff:       extractInt32(data, "textRange", "endOffset"),
+			Component:    extractField(data, "component"),
+			CreationDate: parseISODate(extractField(data, "creationDate")),
+		}, scanreport.AdHocRuleInput{
+			EngineID:    engineID,
+			RuleID:      key,
+			Name:        key,
+			Description: fmt.Sprintf("Rule from %s plugin", engineID),
+			Severity:    extractField(data, "severity"),
+			Type:        extractField(data, "type"),
+		}, true
 }
 
 // loadExtractedHotspots loads hotspots from the extract and converts them
@@ -598,7 +598,7 @@ var sonarCloudRuleRepos = map[string]bool{
 	"dart": true, "rust": true,
 	"ansible": true, "githubactions": true,
 	"groovydre": true,
-	"json": true, "yaml": true,
+	"json":      true, "yaml": true,
 	"jcl": true,
 }
 
@@ -624,9 +624,33 @@ func loadExtractedActiveRules(e *Executor, serverURL, serverKey string) []scanre
 			Severity:    extractField(item.Data, "severity"),
 			QProfileKey: extractField(item.Data, "qProfile"),
 			Language:    extractField(item.Data, "lang"),
+			// The getActiveProfileRules extract task is backed by
+			// /api/rules/search?activation=true&qprofile=...&inheritance=NONE
+			// which returns per-rule params, impacts, and the rule
+			// definition's createdAt/updatedAt. We forward all of them so
+			// the scanner-report active rules match what the source QP
+			// carried (issue #319).
+			Params:    common.ExtractStringMap(item.Data, "params"),
+			CreatedAt: common.ExtractTime(item.Data, "createdAt"),
+			UpdatedAt: common.ExtractTime(item.Data, "updatedAt"),
+			Impacts:   toRuleImpacts(common.ExtractImpacts(item.Data, "impacts")),
 		})
 	}
 	return rules
+}
+
+// toRuleImpacts converts a slice of common.RuleImpact into the
+// scan-report package's own RuleImpact type. The two are structurally
+// identical but live in different packages to keep import graphs clean.
+func toRuleImpacts(in []common.RuleImpact) []scanreport.RuleImpact {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]scanreport.RuleImpact, len(in))
+	for i, r := range in {
+		out[i] = scanreport.RuleImpact{SoftwareQuality: r.SoftwareQuality, Severity: r.Severity}
+	}
+	return out
 }
 
 func loadExtractedQProfiles(e *Executor, serverURL, serverKey string) []scanreport.QProfileInfo {

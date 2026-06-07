@@ -236,9 +236,9 @@ func setupScanHistoryExtract(t *testing.T, dir string) {
 			"key": "issue-1", "rule": "java:S100", "message": "Rename method",
 			"severity": "MAJOR", "component": "proj1:src/Main.java",
 			"projectKey": "proj1", "branch": "main",
-			"textRange":  map[string]any{"startLine": 5, "endLine": 5, "startOffset": 0, "endOffset": 10},
+			"textRange":    map[string]any{"startLine": 5, "endLine": 5, "startOffset": 0, "endOffset": 10},
 			"creationDate": "2024-06-15T10:00:00+0000",
-			"serverUrl": testServerURL,
+			"serverUrl":    testServerURL,
 		},
 		{
 			"key": "issue-2", "rule": "java:S200", "message": "Other issue",
@@ -257,8 +257,8 @@ func setupScanHistoryExtract(t *testing.T, dir string) {
 		},
 		{
 			"key": "proj1:src/Util.java", "name": "Util.java", "path": "src/Util.java",
-			"language": "java",
-			"measures": []map[string]any{{"metric": "ncloc", "value": "30"}},
+			"language":   "java",
+			"measures":   []map[string]any{{"metric": "ncloc", "value": "30"}},
 			"projectKey": "proj1", "branch": "main",
 			"serverUrl": testServerURL,
 		},
@@ -278,8 +278,21 @@ func setupScanHistoryExtract(t *testing.T, dir string) {
 	})
 
 	writeJSONL(filepath.Join(extractDir, "getActiveProfileRules"), []map[string]any{
-		{"key": "java:S100", "severity": "MAJOR", "qProfile": "prof1", "lang": "java", "serverUrl": testServerURL},
-		{"key": "external_tool:E1", "severity": "INFO", "qProfile": "prof1", "lang": "java", "serverUrl": testServerURL},
+		{
+			"key":       "java:S100",
+			"severity":  "MAJOR",
+			"qProfile":  "prof1",
+			"lang":      "java",
+			"params":    []map[string]string{{"key": "format", "value": "google"}},
+			"impacts":   []map[string]string{{"softwareQuality": "MAINTAINABILITY", "severity": "HIGH"}},
+			"createdAt": "2024-01-15T10:00:00+0000",
+			"updatedAt": "2024-02-20T14:30:00+0000",
+			"serverUrl": testServerURL,
+		},
+		{
+			"key": "external_tool:E1", "severity": "INFO", "qProfile": "prof1", "lang": "java",
+			"serverUrl": testServerURL,
+		},
 	})
 
 	writeJSONL(filepath.Join(extractDir, "getProfiles"), []map[string]any{
@@ -291,8 +304,8 @@ func setupScanHistoryExtract(t *testing.T, dir string) {
 			"key": "hotspot-1", "ruleKey": "java:S2092", "message": "Make this cookie secure",
 			"component": "proj1:src/Main.java", "project": "proj1", "branch": "main",
 			"vulnerabilityProbability": "HIGH",
-			"creationDate": "2024-03-10T08:00:00+0000",
-			"serverUrl": testServerURL,
+			"creationDate":             "2024-03-10T08:00:00+0000",
+			"serverUrl":                testServerURL,
 		},
 	})
 }
@@ -441,6 +454,37 @@ func TestLoadExtractedActiveRules(t *testing.T) {
 	if rules[0].RuleRepo != "java" || rules[0].RuleKey != "S100" {
 		t.Errorf("unexpected rule: %s:%s", rules[0].RuleRepo, rules[0].RuleKey)
 	}
+	// Issue #319: params, impacts, and timestamps must be forwarded from
+	// the extract data into ActiveRuleInput.
+	if got, want := rules[0].Params, map[string]string{"format": "google"}; !mapsEqualScan(got, want) {
+		t.Errorf("Params: got %v, want %v", got, want)
+	}
+	if len(rules[0].Impacts) != 1 {
+		t.Fatalf("expected 1 impact, got %d", len(rules[0].Impacts))
+	}
+	if rules[0].Impacts[0].SoftwareQuality != "MAINTAINABILITY" || rules[0].Impacts[0].Severity != "HIGH" {
+		t.Errorf("impact[0]: got %+v", rules[0].Impacts[0])
+	}
+	wantCreated, _ := time.Parse(time.RFC3339, "2024-01-15T10:00:00Z")
+	if !rules[0].CreatedAt.Equal(wantCreated) {
+		t.Errorf("CreatedAt: got %v, want %v", rules[0].CreatedAt, wantCreated)
+	}
+	wantUpdated, _ := time.Parse(time.RFC3339, "2024-02-20T14:30:00Z")
+	if !rules[0].UpdatedAt.Equal(wantUpdated) {
+		t.Errorf("UpdatedAt: got %v, want %v", rules[0].UpdatedAt, wantUpdated)
+	}
+}
+
+func mapsEqualScan(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
 }
 
 func TestLoadExtractedQProfiles(t *testing.T) {
@@ -467,7 +511,7 @@ func TestToExtractedIssues(t *testing.T) {
 			RuleKey:      "S100",
 			Component:    "proj1:src/Main.java",
 			StartLine:    5,
-			EndLine:       5,
+			EndLine:      5,
 		},
 	}
 

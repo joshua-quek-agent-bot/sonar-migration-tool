@@ -294,6 +294,14 @@ func BuildMeasures(measures []MeasureInput, cr *ComponentRef) map[int32][]*pb.Me
 	return result
 }
 
+// RuleImpact is a {softwareQuality, severity} pair, mirroring the SonarQube
+// "impacts" payload emitted by /api/rules/search. It is converted to the
+// scan-report proto's pb.Impact inside BuildActiveRules.
+type RuleImpact struct {
+	SoftwareQuality string
+	Severity        string
+}
+
 // ActiveRuleInput holds data for building an ActiveRule message.
 type ActiveRuleInput struct {
 	RuleRepo    string
@@ -301,18 +309,49 @@ type ActiveRuleInput struct {
 	Severity    string
 	QProfileKey string
 	Language    string
+	// Params is the per-rule parameter overrides set when the rule was
+	// activated in the source quality profile. May be nil/empty.
+	Params map[string]string
+	// CreatedAt is the rule definition's createdAt timestamp (best
+	// approximation of "activation time" available from the
+	// /api/rules/search payload used by the scanner-report path).
+	CreatedAt time.Time
+	// UpdatedAt is the rule definition's updatedAt timestamp.
+	UpdatedAt time.Time
+	// Impacts is the per-rule impact overrides (clean-code attributes) set
+	// when the rule was activated in the source quality profile.
+	Impacts []RuleImpact
 }
 
 // BuildActiveRules creates ActiveRule protobuf messages from the input slice.
 func BuildActiveRules(rules []ActiveRuleInput) []*pb.ActiveRule {
 	result := make([]*pb.ActiveRule, 0, len(rules))
 	for _, r := range rules {
-		result = append(result, &pb.ActiveRule{
+		ar := &pb.ActiveRule{
 			RuleRepository: r.RuleRepo,
 			RuleKey:        r.RuleKey,
 			Severity:       mapSeverity(r.Severity),
 			QProfileKey:    r.QProfileKey,
-		})
+		}
+		if len(r.Params) > 0 {
+			ar.ParamsByKey = make(map[string]string, len(r.Params))
+			for k, v := range r.Params {
+				ar.ParamsByKey[k] = v
+			}
+		}
+		if !r.CreatedAt.IsZero() {
+			ar.CreatedAt = r.CreatedAt.UnixMilli()
+		}
+		if !r.UpdatedAt.IsZero() {
+			ar.UpdatedAt = r.UpdatedAt.UnixMilli()
+		}
+		for _, im := range r.Impacts {
+			ar.Impacts = append(ar.Impacts, &pb.Impact{
+				SoftwareQuality: mapSoftwareQuality(im.SoftwareQuality),
+				Severity:        mapImpactSeverity(im.Severity),
+			})
+		}
+		result = append(result, ar)
 	}
 	return result
 }
@@ -349,6 +388,42 @@ func mapSeverity(s string) pb.Severity {
 		return pb.Severity_BLOCKER
 	default:
 		return pb.Severity_UNSET_SEVERITY
+	}
+}
+
+// mapSoftwareQuality converts a Sonar "software quality" identifier (e.g.
+// MAINTAINABILITY, RELIABILITY, SECURITY) to its protobuf enum value.
+func mapSoftwareQuality(q string) pb.SoftwareQuality {
+	switch strings.ToUpper(strings.TrimSpace(q)) {
+	case "MAINTAINABILITY":
+		return pb.SoftwareQuality_MAINTAINABILITY
+	case "RELIABILITY":
+		return pb.SoftwareQuality_RELIABILITY
+	case "SECURITY":
+		return pb.SoftwareQuality_SECURITY
+	default:
+		return pb.SoftwareQuality_UNKNOWN_IMPACT_QUALITY
+	}
+}
+
+// mapImpactSeverity converts a Sonar impact severity (LOW, MEDIUM, HIGH,
+// INFO, BLOCKER) to its protobuf enum value. Note: this enum is
+// intentionally distinct from mapSeverity above (it uses BLOCKER at slot 5
+// and lacks MINOR/MAJOR/CRITICAL).
+func mapImpactSeverity(s string) pb.ImpactSeverity {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "LOW":
+		return pb.ImpactSeverity_ImpactSeverity_LOW
+	case "MEDIUM":
+		return pb.ImpactSeverity_ImpactSeverity_MEDIUM
+	case "HIGH":
+		return pb.ImpactSeverity_ImpactSeverity_HIGH
+	case "INFO":
+		return pb.ImpactSeverity_ImpactSeverity_INFO
+	case "BLOCKER":
+		return pb.ImpactSeverity_ImpactSeverity_BLOCKER
+	default:
+		return pb.ImpactSeverity_ImpactSeverity_UNKNOWN_IMPACT_SEVERITY
 	}
 }
 

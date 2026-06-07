@@ -187,6 +187,121 @@ func TestBuildActiveRules(t *testing.T) {
 	if result[1].Severity != pb.Severity_BLOCKER {
 		t.Errorf("expected BLOCKER severity, got %v", result[1].Severity)
 	}
+	// Sanity: rules without explicit params/impacts/timestamps must NOT
+	// emit empty ParamsByKey or zeroed timestamps (issue #319).
+	if result[0].ParamsByKey != nil {
+		t.Errorf("expected nil ParamsByKey for unset params, got %v", result[0].ParamsByKey)
+	}
+	if result[0].CreatedAt != 0 || result[0].UpdatedAt != 0 {
+		t.Errorf("expected zero timestamps for unset CreatedAt/UpdatedAt, got %d/%d",
+			result[0].CreatedAt, result[0].UpdatedAt)
+	}
+	if len(result[0].Impacts) != 0 {
+		t.Errorf("expected no impacts for unset Impacts, got %d", len(result[0].Impacts))
+	}
+}
+
+// TestBuildActiveRulesRich exercises the full ActiveRuleInput shape
+// (params, createdAt, updatedAt, impacts) added for issue #319.
+func TestBuildActiveRulesRich(t *testing.T) {
+	created := time.Date(2024, 5, 1, 10, 0, 0, 0, time.UTC)
+	updated := time.Date(2024, 6, 1, 12, 30, 0, 0, time.UTC)
+	rules := []ActiveRuleInput{
+		{
+			RuleRepo:    "java",
+			RuleKey:     "S100",
+			Severity:    "CRITICAL",
+			QProfileKey: "qp-java",
+			Language:    "java",
+			Params:      map[string]string{"format": "google", "max": "120"},
+			CreatedAt:   created,
+			UpdatedAt:   updated,
+			Impacts: []RuleImpact{
+				{SoftwareQuality: "MAINTAINABILITY", Severity: "HIGH"},
+				{SoftwareQuality: "RELIABILITY", Severity: "MEDIUM"},
+			},
+		},
+	}
+
+	result := BuildActiveRules(rules)
+	if len(result) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(result))
+	}
+	r := result[0]
+	if r.RuleRepository != "java" || r.RuleKey != "S100" {
+		t.Errorf("unexpected rule identity: %s:%s", r.RuleRepository, r.RuleKey)
+	}
+	if r.Severity != pb.Severity_CRITICAL {
+		t.Errorf("expected CRITICAL, got %v", r.Severity)
+	}
+	if r.QProfileKey != "qp-java" {
+		t.Errorf("expected qp-java, got %s", r.QProfileKey)
+	}
+	if got, want := r.ParamsByKey, map[string]string{"format": "google", "max": "120"}; !mapsEqual(got, want) {
+		t.Errorf("ParamsByKey: got %v, want %v", got, want)
+	}
+	if r.CreatedAt != created.UnixMilli() {
+		t.Errorf("CreatedAt: got %d, want %d", r.CreatedAt, created.UnixMilli())
+	}
+	if r.UpdatedAt != updated.UnixMilli() {
+		t.Errorf("UpdatedAt: got %d, want %d", r.UpdatedAt, updated.UnixMilli())
+	}
+	if len(r.Impacts) != 2 {
+		t.Fatalf("expected 2 impacts, got %d", len(r.Impacts))
+	}
+	if r.Impacts[0].SoftwareQuality != pb.SoftwareQuality_MAINTAINABILITY ||
+		r.Impacts[0].Severity != pb.ImpactSeverity_ImpactSeverity_HIGH {
+		t.Errorf("impact[0]: got %+v", r.Impacts[0])
+	}
+	if r.Impacts[1].SoftwareQuality != pb.SoftwareQuality_RELIABILITY ||
+		r.Impacts[1].Severity != pb.ImpactSeverity_ImpactSeverity_MEDIUM {
+		t.Errorf("impact[1]: got %+v", r.Impacts[1])
+	}
+}
+
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
+}
+
+func TestMapSoftwareQuality(t *testing.T) {
+	cases := map[string]pb.SoftwareQuality{
+		"MAINTAINABILITY": pb.SoftwareQuality_MAINTAINABILITY,
+		"maintainability": pb.SoftwareQuality_MAINTAINABILITY,
+		"  RELIABILITY ":  pb.SoftwareQuality_RELIABILITY,
+		"SECURITY":        pb.SoftwareQuality_SECURITY,
+		"":                pb.SoftwareQuality_UNKNOWN_IMPACT_QUALITY,
+		"bogus":           pb.SoftwareQuality_UNKNOWN_IMPACT_QUALITY,
+	}
+	for in, want := range cases {
+		if got := mapSoftwareQuality(in); got != want {
+			t.Errorf("mapSoftwareQuality(%q): got %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestMapImpactSeverity(t *testing.T) {
+	cases := map[string]pb.ImpactSeverity{
+		"LOW":     pb.ImpactSeverity_ImpactSeverity_LOW,
+		"medium":  pb.ImpactSeverity_ImpactSeverity_MEDIUM,
+		"HIGH":    pb.ImpactSeverity_ImpactSeverity_HIGH,
+		"info":    pb.ImpactSeverity_ImpactSeverity_INFO,
+		"BLOCKER": pb.ImpactSeverity_ImpactSeverity_BLOCKER,
+		"":        pb.ImpactSeverity_ImpactSeverity_UNKNOWN_IMPACT_SEVERITY,
+		"MAJOR":   pb.ImpactSeverity_ImpactSeverity_UNKNOWN_IMPACT_SEVERITY, // not a valid impact severity
+	}
+	for in, want := range cases {
+		if got := mapImpactSeverity(in); got != want {
+			t.Errorf("mapImpactSeverity(%q): got %v, want %v", in, got, want)
+		}
+	}
 }
 
 func TestBuildDefaultChangesets(t *testing.T) {
