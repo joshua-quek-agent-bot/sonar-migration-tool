@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package cmd
 
 import (
@@ -19,7 +23,6 @@ func newMigrateTestCmd() *cobra.Command {
 	f.String("export_directory", "", "")
 	f.String("target_task", "", "")
 	f.Bool("skip_profiles", false, "")
-	f.Bool("include_scan_history", false, "")
 	f.Bool("debug", false, "")
 	f.String("default_organization", "", "")
 	return cmd

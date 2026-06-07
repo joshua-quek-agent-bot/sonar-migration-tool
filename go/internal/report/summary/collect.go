@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package summary
 
 import (
@@ -34,7 +38,7 @@ func CollectSummary(runDir, exportDir string) (*MigrationSummary, error) {
 		return nil, err
 	}
 
-	scanHistoryMap := collectScanHistory(store)
+	projectDataMap := collectProjectData(store)
 	ncdFallbackMap := collectNCDFallback(store)
 	ncdBranchOverrideSet := collectNCDBranchOverrides(store)
 	extractMapping, _ := structure.GetUniqueExtracts(exportDir)
@@ -43,7 +47,7 @@ func CollectSummary(runDir, exportDir string) (*MigrationSummary, error) {
 	for _, def := range sectionDefs {
 		section := collectSection(store, def, failuresByType, configFailures, exportDir, extractMapping)
 		if def.Name == "Projects" {
-			attachScanHistory(section.Succeeded, scanHistoryMap)
+			attachProjectData(section.Succeeded, projectDataMap)
 			section.Succeeded, section.Partial = applyNCDFallbackPartials(section.Succeeded, section.Partial, ncdFallbackMap)
 			section.Succeeded, section.Partial = applyNCDBranchOverridePartials(section.Succeeded, section.Partial, ncdBranchOverrideSet)
 			// #228 — per-project follow-up operations (tags, settings,
@@ -62,12 +66,33 @@ func CollectSummary(runDir, exportDir string) (*MigrationSummary, error) {
 	}
 
 	runID := extractRunID(runDir)
-	return &MigrationSummary{
+	sum := &MigrationSummary{
 		RunID:       runID,
 		GeneratedAt: time.Now(),
 		Sections:    sections,
 		Limitations: collectLimitations(runDir, exportDir, extractMapping),
-	}, nil
+		RateLimit:   collectRateLimitReport(runDir, failuresByType),
+	}
+
+	// Fold in migrate-engine runtime telemetry (run_meta.json /
+	// run_events.jsonl / requests.log). collectRuntime never returns a
+	// hard error for absent files, so predictive reports — which have
+	// none of these — simply leave the runtime fields at their zero
+	// values and the runtime sections omit themselves.
+	if rt, err := collectRuntime(runDir); err == nil {
+		sum.StartedAt = rt.StartedAt
+		sum.CompletedAt = rt.CompletedAt
+		sum.TotalElapsed = rt.TotalElapsed
+		sum.OverallStatus = rt.OverallStatus
+		sum.Phases = rt.Phases
+		sum.Tasks = rt.Tasks
+		sum.Failures = rt.Failures
+		sum.Warnings = rt.Warnings
+		sum.Branches = rt.Branches
+		sum.Throughput = rt.Throughput
+	}
+
+	return sum, nil
 }
 
 // collectLimitations builds the free-text bullet list rendered in the
@@ -211,17 +236,17 @@ func collectGlobalSettingMappingLimitations(exportDir string, mapping structure.
 // list is deliberately small and explicit so a setting that merely
 // happens to start with "sonar.security" doesn't trip the heuristic.
 var sastCustomizationKeys = map[string]bool{
-	"sonar.security.config.javasecurity":       true,
-	"sonar.security.config.phpsecurity":        true,
-	"sonar.security.config.pythonsecurity":     true,
+	"sonar.security.config.javasecurity":                     true,
+	"sonar.security.config.phpsecurity":                      true,
+	"sonar.security.config.pythonsecurity":                   true,
 	"sonar.security.config.roslyn.sonaranalyzer.security.cs": true,
-	"sonar.security.config.jssecurity":         true,
-	"sonar.security.config.tssecurity":         true,
-	"sonar.security.sources.javasecurity":      true,
-	"sonar.security.sources.phpsecurity":       true,
-	"sonar.security.sources.pythonsecurity":    true,
-	"sonar.security.sources.jssecurity":        true,
-	"sonar.security.sources.tssecurity":        true,
+	"sonar.security.config.jssecurity":                       true,
+	"sonar.security.config.tssecurity":                       true,
+	"sonar.security.sources.javasecurity":                    true,
+	"sonar.security.sources.phpsecurity":                     true,
+	"sonar.security.sources.pythonsecurity":                  true,
+	"sonar.security.sources.jssecurity":                      true,
+	"sonar.security.sources.tssecurity":                      true,
 }
 
 // collectSASTCustomizationLimitation scans server-level and project-
@@ -675,10 +700,10 @@ func collectFailed(failuresByType map[string][]analysis.ReportRow, def sectionDe
 	return result
 }
 
-// collectScanHistory reads importScanHistory JSONL and returns a map of
+// collectProjectData reads importProjectData JSONL and returns a map of
 // cloud_project_key -> status ("success", "failed", "skipped").
-func collectScanHistory(store *common.DataStore) map[string]string {
-	items, err := store.ReadAll("importScanHistory")
+func collectProjectData(store *common.DataStore) map[string]string {
+	items, err := store.ReadAll("importProjectData")
 	if err != nil || len(items) == 0 {
 		return nil
 	}
@@ -693,8 +718,8 @@ func collectScanHistory(store *common.DataStore) map[string]string {
 	return result
 }
 
-// attachScanHistory adds scan history status to project EntityItems.
-func attachScanHistory(projects []EntityItem, scanMap map[string]string) {
+// attachProjectData adds project data status to project EntityItems.
+func attachProjectData(projects []EntityItem, scanMap map[string]string) {
 	if scanMap == nil {
 		return
 	}

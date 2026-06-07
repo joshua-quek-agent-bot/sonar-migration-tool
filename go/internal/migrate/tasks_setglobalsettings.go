@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package migrate
 
 import (
@@ -513,7 +517,7 @@ func runSetGlobalSettings(ctx context.Context, e *Executor) error {
 	// would race against — and potentially overwrite — those values.
 	overrideCovered := buildPerProjectOverrideCoverage(e)
 
-	counter := NewTaskCounter("setGlobalSettings")
+	counter := TaskCounterFromContext(ctx)
 	w, err := e.Store.Writer("setGlobalSettings")
 	if err != nil {
 		return err
@@ -628,7 +632,6 @@ func runSetGlobalSettings(ctx context.Context, e *Executor) error {
 		mu.Unlock()
 	}
 
-	counter.LogSummary(e.Logger)
 	return nil
 }
 
@@ -804,7 +807,7 @@ func fanOutOutcome(ctx context.Context, e *Executor, raw json.RawMessage,
 		e.Logger.Debug("setGlobalSettings: org-level write already rejected for this key, propagating to projects without retrying",
 			"key", key, "org", org)
 	} else {
-		e.Logger.Info("setGlobalSettings: key not settable at org level despite list_definitions claim, propagating to projects",
+		e.Logger.Debug("setGlobalSettings: key not settable at org level despite list_definitions claim, propagating to projects",
 			"key", key, "org", org)
 	}
 	applied, failed, skipped := fanOutGlobalToProjects(ctx, e, raw, key, org, projectDef, projectKeyMap, overrideCovered)
@@ -911,7 +914,13 @@ func fanOutGlobalToProjects(ctx context.Context, e *Executor, raw json.RawMessag
 			skipped = append(skipped, pm.CloudKey)
 			continue
 		}
-		err := applySettingByDef(ctx, e, pm.CloudKey, pm.OrgKey, raw, key, def, true)
+		// Retry the per-project apply when SQC reports the project
+		// as not-yet-indexed (#334). The indexing-lag window is
+		// independent of /api/projects/search readiness so we can
+		// only handle it at the call site.
+		err := retryOnProjectNotFound(ctx, e.Logger, func() error {
+			return applySettingByDef(ctx, e, pm.CloudKey, pm.OrgKey, raw, key, def, true)
+		}, "endpoint", "/api/settings/set", "project", pm.CloudKey, "org", org, "setting_key", key)
 		switch {
 		case errors.Is(err, errSettingEmpty):
 			// nothing to do

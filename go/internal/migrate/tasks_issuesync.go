@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package migrate
 
 import (
@@ -12,20 +16,19 @@ import (
 
 	sqapi "github.com/sonar-solutions/sq-api-go"
 	"github.com/sonar-solutions/sonar-migration-tool/internal/common"
-	"golang.org/x/sync/errgroup"
 )
 
 // issueMetadataSyncTasks returns the task definition for synchronising
 // issue metadata (status transitions, comments, tags) from the extracted
 // SonarQube Server data to the newly-created SonarQube Cloud issues.
 //
-// The task depends on importScanHistory because Cloud issues only exist
+// The task depends on importProjectData because Cloud issues only exist
 // after the scan report has been processed by the CE.
 func issueMetadataSyncTasks() []TaskDef {
 	return []TaskDef{{
 		Name:         "syncIssueMetadata",
 		Editions:     common.AllEditions,
-		Dependencies: []string{"importScanHistory"},
+		Dependencies: []string{"importProjectData"},
 		Run:          runSyncIssueMetadata,
 	}}
 }
@@ -269,7 +272,7 @@ func isExpectedTransitionError(err error) bool {
 // the issue metadata (transitions, comments, tags) from the SQS extract
 // to the corresponding Cloud issues.
 func runSyncIssueMetadata(ctx context.Context, e *Executor) error {
-	counter := NewTaskCounter("syncIssueMetadata")
+	counter := TaskCounterFromContext(ctx)
 	err := forEachMigrateItem(ctx, e, "syncIssueMetadata", "createProjects",
 		func(ctx context.Context, item json.RawMessage, w *common.ChunkWriter) error {
 			cloudKey := extractField(item, "cloud_project_key")
@@ -281,7 +284,6 @@ func runSyncIssueMetadata(ctx context.Context, e *Executor) error {
 			}
 			return syncProjectIssues(ctx, e, cloudKey, orgKey, serverURL, serverKey, counter)
 		})
-	counter.LogSummary(e.Logger)
 	return err
 }
 
@@ -325,7 +327,14 @@ func syncProjectIssues(ctx context.Context, e *Executor, cloudKey, orgKey, serve
 		return nil // non-fatal — skip project
 	}
 	if len(cloudIssues) == 0 {
-		e.Logger.Debug("syncIssueMetadata: no cloud issues to match", "project", cloudKey)
+		// Source had issues worth syncing, but Cloud has nothing to
+		// match against. Most common cause: the project-data CE task
+		// for this project failed (or was skipped), so the report was
+		// never indexed and Cloud has no issues yet. Promote to INFO
+		// so the operator can correlate the skip with the upstream
+		// failure log instead of wondering why nothing happened. #299.
+		e.Logger.Info("syncIssueMetadata: skipping project — no Cloud issues to match (project-data CE task likely failed or was skipped)",
+			"project", cloudKey, "source_issues", len(sourceIssues))
 		return nil
 	}
 
@@ -354,27 +363,24 @@ func syncProjectIssues(ctx context.Context, e *Executor, cloudKey, orgKey, serve
 		"actionable", len(actionable),
 	)
 
-	// 6. Sync pairs with bounded concurrency.
+	// 6. Sync pairs with bounded concurrency, emitting a per-
+	// project "Project key <key> issue sync: N/M - X%" line every
+	// 20 completions (#300 / #348). The label includes the cloud
+	// project key so an operator tailing the log can disentangle
+	// the lines coming from concurrent projects' inner loops
+	// (issue #348). runProjectSyncLoop handles the errgroup, the
+	// semaphore bound, and the progress logger.
 	//
 	// RACE-CONDITION SAFETY:
 	//   - actionable slice is read-only during this phase.
 	//   - Each goroutine receives exactly ONE issuePair by value.
 	//   - counter uses atomic operations (existing pattern).
 	//   - No shared mutable state is accessed.
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(cap(e.Sem))
-	for _, pair := range actionable {
-		g.Go(func() error {
-			if gctx.Err() != nil {
-				return gctx.Err()
-			}
+	label := "Project key " + cloudKey + " issue sync:"
+	runProjectSyncLoop(ctx, e, actionable, label, 20,
+		func(gctx context.Context, pair issuePair) {
 			syncOnePair(gctx, e, pair, counter)
-			return nil
 		})
-	}
-	if err := g.Wait(); err != nil {
-		return err
-	}
 
 	return nil
 }

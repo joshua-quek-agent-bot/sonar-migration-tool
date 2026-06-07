@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package migrate
 
 import (
@@ -11,7 +15,6 @@ import (
 	"github.com/sonar-solutions/sonar-migration-tool/internal/common"
 	"github.com/sonar-solutions/sonar-migration-tool/internal/structure"
 	"github.com/sonar-solutions/sq-api-go/types"
-	"golang.org/x/sync/errgroup"
 )
 
 // hotspotMetadataSyncTasks returns the task definitions for syncing hotspot
@@ -20,7 +23,7 @@ func hotspotMetadataSyncTasks() []TaskDef {
 	return []TaskDef{{
 		Name:         "syncHotspotMetadata",
 		Editions:     common.AllEditions,
-		Dependencies: []string{"importScanHistory"},
+		Dependencies: []string{"importProjectData"},
 		Run:          runSyncHotspotMetadata,
 	}}
 }
@@ -195,9 +198,12 @@ type syncHotspotResult struct {
 }
 
 // syncProjectHotspots synchronises hotspot metadata for a single project.
+// A per-project counter is kept alongside the top-level task counter so each
+// project gets its own "task summary" line (#333 merge-format).
 func syncProjectHotspots(ctx context.Context, e *Executor, input syncHotspotInput) (syncHotspotResult, error) {
+	projStart := time.Now()
 	counter := NewTaskCounter("syncHotspotMetadata:" + input.CloudKey)
-	defer counter.LogSummary(e.Logger)
+	defer func() { counter.LogSummary(e.Logger, time.Since(projStart)) }()
 
 	matchedPairs, allCount, err := buildHotspotPairs(ctx, e, input)
 	if err != nil {
@@ -207,18 +213,21 @@ func syncProjectHotspots(ctx context.Context, e *Executor, input syncHotspotInpu
 		return syncHotspotResult{Skipped: int64(allCount)}, nil
 	}
 
-	// Sync pairs concurrently with bounded parallelism.
+	// Sync pairs concurrently with bounded parallelism, emitting a
+	// per-project "Project key <key> hotspot sync: N/M - X%" line
+	// every 10 completions (#300 / #348). The label includes the
+	// cloud project key so an operator tailing the log can
+	// disentangle the lines coming from concurrent projects' inner
+	// loops (#348). buildHotspotPairs already filters to the
+	// actionable set, so len(matchedPairs) is the right
+	// denominator. runProjectSyncLoop handles the errgroup, the
+	// semaphore bound, and the progress logger.
+	//
 	// matchedPairs is fully built BEFORE launching goroutines. Each goroutine
 	// operates on exactly ONE pair -- no cross-pair sharing, no race conditions.
-	g, gctx := errgroup.WithContext(ctx)
-	g.SetLimit(cap(e.Sem))
-
-	for i := range matchedPairs {
-		pair := matchedPairs[i]
-		g.Go(func() error {
-			if gctx.Err() != nil {
-				return nil
-			}
+	label := "Project key " + input.CloudKey + " hotspot sync:"
+	runProjectSyncLoop(ctx, e, matchedPairs, label, 10,
+		func(gctx context.Context, pair hotspotPair) {
 			if err := syncOneHotspot(gctx, e, pair); err != nil {
 				counter.Fail()
 				logAPIWarn(e.Logger, "syncHotspotMetadata: hotspot sync failed", err,
@@ -226,10 +235,7 @@ func syncProjectHotspots(ctx context.Context, e *Executor, input syncHotspotInpu
 			} else {
 				counter.Success()
 			}
-			return nil
 		})
-	}
-	g.Wait() //nolint:errcheck // goroutines always return nil; errors are per-pair
 
 	return syncHotspotResult{
 		Synced:  counter.succeeded.Load(),
@@ -272,6 +278,17 @@ func buildHotspotPairs(ctx context.Context, e *Executor, input syncHotspotInput)
 		return nil, 0, err
 	}
 	cloudHotspots := loadCloudMatchableHotspots(cloudAPIHotspots)
+
+	// Source had hotspots worth syncing, but Cloud has none. Most
+	// common cause: the project-data CE task for this project failed
+	// (or was skipped), so the report was never indexed and Cloud
+	// has no hotspots yet. Surface that explicitly at INFO so the
+	// operator can correlate the skip with the upstream failure. #299.
+	if len(cloudHotspots) == 0 {
+		e.Logger.Info("syncHotspotMetadata: skipping project — no Cloud hotspots to match (project-data CE task likely failed or was skipped)",
+			"project", input.CloudKey, "source_hotspots", len(sourceHotspots))
+		return nil, 0, nil
+	}
 
 	allPairs := matchHotspots(sourceHotspots, cloudHotspots, input.ServerKey, input.CloudKey)
 	actionable := filterActionableHotspotPairs(allPairs)

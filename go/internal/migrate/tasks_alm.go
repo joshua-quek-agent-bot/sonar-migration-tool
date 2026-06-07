@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package migrate
 
 import (
@@ -89,7 +93,7 @@ func runMatchProjectRepos(ctx context.Context, e *Executor) error {
 }
 
 func runSetProjectBinding(ctx context.Context, e *Executor) error {
-	counter := NewTaskCounter("setProjectBinding")
+	counter := TaskCounterFromContext(ctx)
 	err := forEachMigrateItem(ctx, e, "setProjectBinding", "matchProjectRepos",
 		func(ctx context.Context, item json.RawMessage, w *common.ChunkWriter) error {
 			projID := extractField(item, "project_id")
@@ -113,7 +117,6 @@ func runSetProjectBinding(ctx context.Context, e *Executor) error {
 			}
 			return nil
 		})
-	counter.LogSummary(e.Logger)
 	return err
 }
 

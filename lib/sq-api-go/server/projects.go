@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package server
 
 import (
@@ -41,6 +45,7 @@ func (p *ProjectsClient) GetDetails(ctx context.Context, component string) (*typ
 		Qualifier:  result.Qualifier,
 		Visibility: result.Visibility,
 		Tags:       result.Tags,
+		Version:    result.Version,
 	}, nil
 }
 

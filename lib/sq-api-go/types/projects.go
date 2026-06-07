@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package types
 
 // Project represents a single project returned by /api/projects/search.
@@ -22,6 +26,7 @@ type ComponentDetails struct {
 	Qualifier  string   `json:"qualifier"`
 	Visibility string   `json:"visibility"`
 	Tags       []string `json:"tags"`
+	Version    string   `json:"version"`
 }
 
 // ComponentShowResponse is the response envelope for /api/components/show.
@@ -36,6 +41,7 @@ type NavigationComponentResponse struct {
 	Qualifier  string   `json:"qualifier"`
 	Visibility string   `json:"visibility"`
 	Tags       []string `json:"tags"`
+	Version    string   `json:"version"`
 }
 
 // ProjectsLicenseUsageResponse is the response envelope for /api/projects/license_usage.

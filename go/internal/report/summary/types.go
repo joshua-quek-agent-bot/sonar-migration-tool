@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 // Package summary generates a PDF migration summary report from task outputs.
 package summary
 
@@ -28,6 +32,145 @@ type MigrationSummary struct {
 	Limitations  []string
 	OmitSections map[string]bool
 	Predictive   bool
+
+	// Runtime execution fields (issue #240+ migrate engine telemetry).
+	// These are populated only for real migration runs from the run
+	// directory's run_meta.json / run_events.jsonl. Under predictive
+	// reports they are absent and carry zero values, so the sections
+	// that render them omit themselves entirely.
+	StartedAt     time.Time
+	CompletedAt   time.Time
+	TotalElapsed  time.Duration
+	OverallStatus string
+	Phases        []PhaseTiming
+	Tasks         []TaskTiming
+	Failures      []FailureRow
+	Warnings      WarningLedger
+	Branches      []BranchStat
+	Throughput    ThroughputStats
+
+	// RateLimit is populated only when API rate limiting materially
+	// impacted the run (one or more tasks failed on 429, total pause
+	// exceeded the impact threshold, or any non-SQC 429 was observed).
+	// Nil for clean runs, which renders the report unchanged.
+	RateLimit *RateLimitReport
+}
+
+// RateLimitReport summarises 429 hits seen during the run for inclusion
+// in the orange callout box rendered between the executive summary and
+// the per-section tables.
+//
+// Counts are broken out by classification so the warning text can
+// distinguish between SonarQube Cloud's documented application rate
+// limit (recoverable via pause-and-resume) and non-standard 429s
+// (Cloudflare-managed limits, WAF blocks, or unknown upstreams) that
+// may require operator action.
+type RateLimitReport struct {
+	TotalHits              int
+	SQCHits                int
+	CloudflareHits         int
+	UnknownHits            int
+	CumulativePauseSeconds float64
+	CausedTaskFailure      bool
+	// FirstBodySnippet and FirstHeadersSummary capture the first
+	// non-SQC event observed (Cloudflare or unknown). Empty when the
+	// only observed events were SQC application limits — for those
+	// the body and headers add no operator-actionable signal.
+	FirstBodySnippet    string
+	FirstHeadersSummary string
+}
+
+// PhaseTiming captures the wall-clock duration of one migration phase.
+type PhaseTiming struct {
+	Phase    string
+	Tasks    int
+	Duration time.Duration
+}
+
+// TaskTiming captures the outcome and duration of a single task within a phase.
+type TaskTiming struct {
+	Phase    int
+	Task     string
+	Duration time.Duration
+	OK       bool
+	Err      string
+}
+
+// FailureRow describes a single entity-level failure for the failures table.
+type FailureRow struct {
+	EntityType   string
+	EntityName   string
+	Organization string
+	URL          string
+	HTTPStatus   string
+	ErrorMessage string
+}
+
+// RetryStat aggregates retried requests by method+endpoint.
+type RetryStat struct {
+	Method     string
+	Endpoint   string
+	Count      int
+	MaxAttempt int
+	LastStatus string
+}
+
+// BranchSkip records a branch whose source code could not be retrieved.
+type BranchSkip struct {
+	Branch   string
+	Findings int
+	Reason   string
+}
+
+// GateConditionSkip records a quality-gate condition that was skipped or
+// remapped. Action is "skipped" or "remapped".
+type GateConditionSkip struct {
+	Gate   string
+	Metric string
+	Action string
+	Note   string
+}
+
+// MetricRemap records a source metric remapped to a SonarQube Cloud equivalent.
+type MetricRemap struct {
+	Gate         string
+	SourceMetric string
+	TargetMetric string
+}
+
+// WarningLedger collects the non-fatal advisories surfaced during a run.
+type WarningLedger struct {
+	Retries        []RetryStat
+	BranchSkips    []BranchSkip
+	GateConditions []GateConditionSkip
+	MetricRemaps   []MetricRemap
+}
+
+// BranchStat captures per-branch packaging/submission stats.
+// Status is one of packaged|submitted|skipped.
+type BranchStat struct {
+	Branch         string
+	Type           string
+	Issues         int
+	ExternalIssues int
+	Components     int
+	ActiveRules    int
+	ZipBytes       int64
+	TaskID         string
+	Status         string
+	SkipReason     string
+}
+
+// ThroughputStats aggregates totals across all branches for the run.
+type ThroughputStats struct {
+	TotalIssues         int
+	TotalExternalIssues int
+	TotalComponents     int
+	TotalZipBytes       int64
+	BranchesPackaged    int
+	BranchesSkipped     int
+	TasksSubmitted      int
+	TotalRetries        int
 }
 
 // Section represents a category of migrated entities (e.g., Projects, Quality Gates).
@@ -36,9 +179,9 @@ type MigrationSummary struct {
 // from issues #224 and #227:
 //   - Succeeded   → green  (perfect-fidelity migration)
 //   - NearPerfect → yellow (migrated with a known close-equivalent substitution,
-//                   e.g. a metric mapping from #143)
+//     e.g. a metric mapping from #143)
 //   - Partial     → orange (created on SQC but a follow-up configuration step
-//                   was incomplete, or a feature was dropped)
+//     was incomplete, or a feature was dropped)
 //   - Failed      → red    (create call itself failed)
 //   - Skipped     → grey   (deliberately skipped by configuration)
 type Section struct {
@@ -53,9 +196,9 @@ type Section struct {
 // EntityItem represents a single entity in the report.
 type EntityItem struct {
 	Name         string
-	Language     string   // populated for Quality Profiles only; empty otherwise
+	Language     string // populated for Quality Profiles only; empty otherwise
 	Organization string
-	Detail       string   // cloud key for successes, scan history status, skip reason
+	Detail       string   // cloud key for successes, project data status, skip reason
 	ErrorMessage string   // failures only
 	SkipReason   string   // for skipped items: SkipReason* constants below
 	Issues       []string // for partial migrations: human-readable list of issues

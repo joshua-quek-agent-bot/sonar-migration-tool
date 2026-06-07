@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package migrate
 
 import (
@@ -49,7 +53,7 @@ func createTasks() []TaskDef {
 }
 
 func runCreateProjects(ctx context.Context, e *Executor) error {
-	counter := NewTaskCounter("createProjects")
+	counter := TaskCounterFromContext(ctx)
 	err := forEachMigrateItem(ctx, e, "createProjects", "generateProjectMappings",
 		func(ctx context.Context, item json.RawMessage, w *common.ChunkWriter) error {
 			orgKey := extractField(item, "sonarcloud_org_key")
@@ -115,13 +119,20 @@ func runCreateProjects(ctx context.Context, e *Executor) error {
 			})
 			return w.WriteOne(result)
 		})
-	counter.LogSummary(e.Logger)
 	return err
 }
 
 func runCreateProfiles(ctx context.Context, e *Executor) error {
-	counter := NewTaskCounter("createProfiles")
-	err := forEachMigrateItemFiltered(ctx, e, "createProfiles", "generateProfileMappings",
+	counter := TaskCounterFromContext(ctx)
+	// Serial creation: SonarCloud QP creation is async at the API
+	// layer but enforces (org, name, language) uniqueness at the DB
+	// layer, so two concurrent POSTs racing on the same name can both
+	// succeed at the API and then crash the index. Profile counts are
+	// small (typically <30, 99% of runs <100) so the wall-clock cost
+	// of running serially is negligible. Issue #338.
+	e.Logger.Info("createProfiles: provisioning quality profiles one at a time " +
+		"(SonarCloud requires (org, name, language) uniqueness — see #338)")
+	err := forEachMigrateItemSerial(ctx, e, "createProfiles", "generateProfileMappings",
 		func(item json.RawMessage) bool {
 			lang := extractField(item, "language")
 			return !unsupportedLanguages[lang]
@@ -135,6 +146,7 @@ func runCreateProfiles(ctx context.Context, e *Executor) error {
 			lang := extractField(item, "language")
 
 			var profileKey string
+			var reusedExisting bool
 			prof, err := e.Cloud.QualityProfiles.Create(ctx, cloud.CreateProfileParams{
 				Name: name, Language: lang, Organization: orgKey,
 			})
@@ -152,10 +164,18 @@ func runCreateProfiles(ctx context.Context, e *Executor) error {
 					return nil
 				}
 				counter.Success()
+				reusedExisting = true
 			} else {
 				counter.Success()
 				profileKey = prof.Key
 			}
+
+			// Per-profile completion line — one per provisioned QP
+			// (#338). Helpful when the serial loop is slow enough to
+			// make the overall task's progress logger feel sparse.
+			e.Logger.Info("createProfiles: provisioned",
+				"name", name, "language", lang, "org", orgKey,
+				"cloud_profile_key", profileKey, "reused_existing", reusedExisting)
 
 			result := common.EnrichRaw(item, map[string]any{
 				"cloud_profile_key":  profileKey,
@@ -163,12 +183,11 @@ func runCreateProfiles(ctx context.Context, e *Executor) error {
 			})
 			return w.WriteOne(result)
 		})
-	counter.LogSummary(e.Logger)
 	return err
 }
 
 func runCreateGates(ctx context.Context, e *Executor) error {
-	counter := NewTaskCounter("createGates")
+	counter := TaskCounterFromContext(ctx)
 	err := forEachMigrateItem(ctx, e, "createGates", "generateGateMappings",
 		func(ctx context.Context, item json.RawMessage, w *common.ChunkWriter) error {
 			orgKey := extractField(item, "sonarcloud_org_key")
@@ -215,12 +234,11 @@ func runCreateGates(ctx context.Context, e *Executor) error {
 			})
 			return w.WriteOne(result)
 		})
-	counter.LogSummary(e.Logger)
 	return err
 }
 
 func runCreateGroups(ctx context.Context, e *Executor) error {
-	counter := NewTaskCounter("createGroups")
+	counter := TaskCounterFromContext(ctx)
 	err := forEachMigrateItem(ctx, e, "createGroups", "generateGroupMappings",
 		func(ctx context.Context, item json.RawMessage, w *common.ChunkWriter) error {
 			orgKey := extractField(item, "sonarcloud_org_key")
@@ -266,12 +284,11 @@ func runCreateGroups(ctx context.Context, e *Executor) error {
 			})
 			return w.WriteOne(result)
 		})
-	counter.LogSummary(e.Logger)
 	return err
 }
 
 func runCreatePermissionTemplates(ctx context.Context, e *Executor) error {
-	counter := NewTaskCounter("createPermissionTemplates")
+	counter := TaskCounterFromContext(ctx)
 	err := forEachMigrateItem(ctx, e, "createPermissionTemplates", "generateTemplateMappings",
 		func(ctx context.Context, item json.RawMessage, w *common.ChunkWriter) error {
 			orgKey := extractField(item, "sonarcloud_org_key")
@@ -316,7 +333,6 @@ func runCreatePermissionTemplates(ctx context.Context, e *Executor) error {
 			})
 			return w.WriteOne(result)
 		})
-	counter.LogSummary(e.Logger)
 	return err
 }
 
@@ -343,7 +359,7 @@ func runCreatePortfolios(ctx context.Context, e *Executor) error {
 	// generatePortfolioMappings + getPortfolioProjects join.
 	emptySourceKeys := buildEmptyPortfolioSet(e)
 
-	counter := NewTaskCounter("createPortfolios")
+	counter := TaskCounterFromContext(ctx)
 	err = forEachMigrateItem(ctx, e, "createPortfolios", "generatePortfolioMappings",
 		func(ctx context.Context, item json.RawMessage, w *common.ChunkWriter) error {
 			name := extractField(item, "name")
@@ -382,7 +398,6 @@ func runCreatePortfolios(ctx context.Context, e *Executor) error {
 			})
 			return w.WriteOne(result)
 		})
-	counter.LogSummary(e.Logger)
 	return err
 }
 

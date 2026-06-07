@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package wizard
 
 import (
@@ -155,9 +159,6 @@ func TestResetPhaseStateExtract(t *testing.T) {
 	if s.SkippedProjects != nil {
 		t.Error("SkippedProjects should be nil after reset")
 	}
-	if s.IncludeScanHistory {
-		t.Error("IncludeScanHistory should be false after reset")
-	}
 	// Unrelated fields should remain.
 	if s.TargetURL == nil {
 		t.Error("TargetURL should be untouched")
@@ -228,6 +229,5 @@ func fullyPopulatedState() *WizardState {
 		ValidationPassed:    true,
 		MigrationRunID:      strPtr("run-1"),
 		SkippedProjects:     []string{"proj-1"},
-		IncludeScanHistory:  true,
 	}
 }

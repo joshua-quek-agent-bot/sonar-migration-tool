@@ -1,8 +1,13 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package migrate
 
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -56,7 +61,7 @@ func TestLoadMigrateConfigFileShapes(t *testing.T) {
 			if err != nil {
 				t.Fatalf("LoadMigrateConfigFile(%s): %v", tc.file, err)
 			}
-			if got != tc.want {
+			if !reflect.DeepEqual(got, tc.want) {
 				t.Errorf("MigrateConfig mismatch\n got=%+v\nwant=%+v", got, tc.want)
 			}
 		})
@@ -197,6 +202,51 @@ func TestLoadMigrateConfigFileUnifiedShape(t *testing.T) {
 	}
 }
 
+// Issue #299: top-level `skip_issue_sync` parses into
+// MigrateConfig.SkipIssueSync one-for-one (no inversion). Defaults to
+// false (sync happens). Verifies every accepted alias from the
+// FlexibleBool type plus case variations.
+func TestLoadMigrateConfigFile_SkipIssueSync(t *testing.T) {
+	cases := []struct {
+		name      string
+		bodyField string
+		wantSkip  bool
+	}{
+		{"absent (default)", "", false},
+		{"true", `"skip_issue_sync": true,`, true},
+		{"false", `"skip_issue_sync": false,`, false},
+		{"string on", `"skip_issue_sync": "on",`, true},
+		{"string off", `"skip_issue_sync": "OFF",`, false},
+		{"string yes", `"skip_issue_sync": "Yes",`, true},
+		{"string no", `"skip_issue_sync": "no",`, false},
+		{"numeric 1", `"skip_issue_sync": 1,`, true},
+		{"numeric 0", `"skip_issue_sync": 0,`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := `{
+  ` + c.bodyField + `
+  "target": {
+    "url": "https://sonarcloud.io/",
+    "token": "t"
+  }
+}`
+			dir := t.TempDir()
+			path := dir + "/skip_issue_sync.json"
+			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadMigrateConfigFile(path)
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if cfg.SkipIssueSync != c.wantSkip {
+				t.Errorf("SkipIssueSync: got %v, want %v", cfg.SkipIssueSync, c.wantSkip)
+			}
+		})
+	}
+}
+
 // Issue #281: target.default_organization parses into
 // MigrateConfig.DefaultOrganization.
 func TestLoadMigrateConfigFileUnifiedShape_DefaultOrganization(t *testing.T) {
@@ -260,5 +310,49 @@ func TestLoadResetConfigFileUnifiedShape(t *testing.T) {
 	if cfg.URL != "https://sonarcloud.io/" || cfg.Token != "sqc_token" ||
 		cfg.EnterpriseKey != "ent-key" || cfg.ExportDirectory != "./out" {
 		t.Errorf("reset cfg: %+v", cfg)
+	}
+}
+
+// Issue #303: top-level `skip_project_data_migration` parses into
+// MigrateConfig.SkipProjectDataMigration one-for-one (no inversion).
+// Defaults to false (data is migrated). Every FlexibleBool alias is
+// accepted, case-insensitive.
+func TestLoadMigrateConfigFile_SkipProjectDataMigration(t *testing.T) {
+	cases := []struct {
+		name      string
+		bodyField string
+		wantSkip  bool
+	}{
+		{"absent (default)", "", false},
+		{"true", `"skip_project_data_migration": true,`, true},
+		{"false", `"skip_project_data_migration": false,`, false},
+		{"string on", `"skip_project_data_migration": "on",`, true},
+		{"string OFF", `"skip_project_data_migration": "OFF",`, false},
+		{"string Yes", `"skip_project_data_migration": "Yes",`, true},
+		{"numeric 1", `"skip_project_data_migration": 1,`, true},
+		{"numeric 0", `"skip_project_data_migration": 0,`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			body := `{
+  ` + c.bodyField + `
+  "target": {
+    "url": "https://sonarcloud.io/",
+    "token": "t"
+  }
+}`
+			dir := t.TempDir()
+			path := dir + "/skip-project-data.json"
+			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadMigrateConfigFile(path)
+			if err != nil {
+				t.Fatalf("load: %v", err)
+			}
+			if cfg.SkipProjectDataMigration != c.wantSkip {
+				t.Errorf("SkipProjectDataMigration: got %v, want %v", cfg.SkipProjectDataMigration, c.wantSkip)
+			}
+		})
 	}
 }

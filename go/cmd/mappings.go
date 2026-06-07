@@ -1,8 +1,15 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package cmd
 
 import (
 	"fmt"
+	"log/slog"
+	"time"
 
+	"github.com/sonar-solutions/sonar-migration-tool/internal/common"
 	"github.com/sonar-solutions/sonar-migration-tool/internal/extract"
 	"github.com/sonar-solutions/sonar-migration-tool/internal/structure"
 	"github.com/spf13/cobra"
@@ -17,6 +24,8 @@ The export directory can be supplied directly via --export_directory or
 read from the same JSON config file the extract / migrate commands use
 via --config (issue #275).`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		defer common.LogCommandDuration(slog.Default(), "mappings", time.Now())
+
 		exportDir, err := resolveMappingsExportDir(cmd)
 		if err != nil {
 			return err

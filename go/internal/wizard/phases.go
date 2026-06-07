@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package wizard
 
 import (
@@ -46,12 +50,6 @@ func phaseExtract(ctx context.Context, p Prompter, state *WizardState, exportDir
 	if err != nil {
 		return err
 	}
-
-	includeScan, err := p.Confirm("Include scan history? (extracts issues, source code, and SCM data for import to SonarQube Cloud)", false)
-	if err != nil {
-		return err
-	}
-	state.IncludeScanHistory = includeScan
 
 	certCfg, err := runExtractWithRetry(ctx, p, state, exportDir, sourceURL, token)
 	if err != nil {
@@ -104,7 +102,7 @@ func runExtractWithRetry(ctx context.Context, p Prompter, state *WizardState, ex
 			PEMFilePath:        cert.pemFile,
 			KeyFilePath:        cert.keyFile,
 			CertPassword:       cert.password,
-			IncludeScanHistory: state.IncludeScanHistory,
+			IncludeProjectData: true,
 		}
 
 		skipped, err := runExtractFn(ctx, cfg)
@@ -427,7 +425,7 @@ func runMigrateWithRetry(ctx context.Context, p Prompter, state *WizardState, ex
 			EnterpriseKey:      ptrStr(state.EnterpriseKey),
 			URL:                ptrStr(state.TargetURL),
 			ExportDirectory:    exportDir,
-			IncludeScanHistory: state.IncludeScanHistory,
+			IncludeProjectData: true,
 		}
 
 		resultID, err := runMigrateFn(ctx, cfg)
@@ -464,11 +462,12 @@ func generateAnalysisReport(p Prompter, exportDir, runID string) {
 		p.DisplayMessage(fmt.Sprintf("Analysis report: %d entries written to %s/final_analysis_report.csv", len(rows), runID))
 	}
 
-	pdfPath, pdfErr := summary.GeneratePDFReport(runDir, exportDir, exportDir)
-	if pdfErr != nil {
-		p.DisplayWarning("Could not generate PDF summary: " + pdfErr.Error())
+	pdfPath, mdPath, err := summary.GenerateReports(runDir, exportDir, exportDir)
+	if err != nil {
+		p.DisplayWarning("Could not generate summary reports: " + err.Error())
 		return
 	}
 	p.DisplayMessage(fmt.Sprintf("PDF summary report: %s", pdfPath))
+	p.DisplayMessage(fmt.Sprintf("Markdown summary report: %s", mdPath))
 }
 

@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package cmd
 
 import (
@@ -48,7 +52,7 @@ func init() {
 	f.Int("timeout", 0, "Number of seconds before a request will timeout")
 	f.String("extract_id", "", "ID of an extract to resume in case of failures")
 	f.String("target_task", "", "Target task to complete; all dependent tasks will be included")
-	f.Bool("include_scan_history", false, "Extract full issue data, source code, and SCM blame for scan history migration")
+	f.Bool(flagSkipProjectDataMigration, false, "Skip extracting project data (issues, hotspots, source code, SCM blame). Defaults to false — project data is extracted by default. #303.")
 }
 
 func buildExtractConfig(cmd *cobra.Command, args []string) (extract.ExtractConfig, error) {
@@ -83,9 +87,17 @@ func buildExtractConfig(cmd *cobra.Command, args []string) (extract.ExtractConfi
 	overrideString(cmd, "target_task", &cfg.TargetTask)
 	overrideInt(cmd, "concurrency", &cfg.Concurrency)
 	overrideInt(cmd, "timeout", &cfg.Timeout)
-	if cmd.Flags().Changed("include_scan_history") {
-		cfg.IncludeScanHistory, _ = cmd.Flags().GetBool("include_scan_history")
+	// Project data is extracted by default. The only opt-out is
+	// SkipProjectDataMigration (CLI --skip_project_data_migration or
+	// config "skip_project_data_migration": true). CLI flag wins over
+	// config; one-way (passing the flag forces opt-out).
+	if cmd.Flags().Changed(flagSkipProjectDataMigration) {
+		v, _ := cmd.Flags().GetBool(flagSkipProjectDataMigration)
+		if v {
+			cfg.SkipProjectDataMigration = true
+		}
 	}
+	cfg.IncludeProjectData = !cfg.SkipProjectDataMigration
 	// --debug is a persistent flag on rootCmd; pick it up here so the
 	// SDK can install the HTTP request/response logger.
 	if cmd.Flags().Changed("debug") {

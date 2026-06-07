@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package migrate
 
 import (
@@ -8,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	sqapi "github.com/sonar-solutions/sq-api-go"
 	"github.com/sonar-solutions/sq-api-go/cloud"
@@ -31,6 +36,8 @@ type ResetConfig struct {
 func RunReset(ctx context.Context, cfg ResetConfig) error {
 	cfg.applyDefaults()
 
+	cmdStart := time.Now()
+
 	cloudURL := cfg.URL
 	apiURL := strings.Replace(cloudURL, "https://", "https://api.", 1)
 
@@ -41,6 +48,9 @@ func RunReset(ctx context.Context, cfg ResetConfig) error {
 		level = slog.LevelDebug
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	// End-of-command timing line (#311). Defer so it fires on every
+	// exit path — success or any of the validate/plan/execute errors.
+	defer common.LogCommandDuration(logger, "reset", cmdStart)
 
 	var clientOpts []sqapi.Option
 	if cfg.Debug {
@@ -139,7 +149,14 @@ func runResetPhase(ctx context.Context, e *Executor, taskNames []string, registr
 		def := registry[name]
 		e.Logger.Info("running task", "task", name)
 		g.Go(func() error {
-			if err := def.Run(ctx, e); err != nil {
+			taskStart := time.Now()
+			counter := NewTaskCounter(name)
+			taskCtx := WithTaskCounter(ctx, counter)
+			err := def.Run(taskCtx, e)
+			// Single end-of-task INFO log carrying counts + duration
+			// (#311 + #333). Empty counter → plain duration line.
+			counter.LogSummary(e.Logger, time.Since(taskStart))
+			if err != nil {
 				return fmt.Errorf("task %s: %w", name, err)
 			}
 			return nil

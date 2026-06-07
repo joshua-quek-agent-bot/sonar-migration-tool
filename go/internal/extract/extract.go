@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package extract
 
 import (
@@ -29,9 +33,10 @@ type ExtractConfig struct {
 	Concurrency     int
 	Timeout         int
 	ExtractID       string
-	TargetTask         string
-	IncludeScanHistory bool
-	Debug              bool // Enable HTTP request/response logging via SDK debug transport
+	TargetTask               string
+	IncludeProjectData       bool
+	SkipProjectDataMigration bool // #303. Set true to skip project-data tasks (issues, source, SCM blame).
+	Debug                    bool // Enable HTTP request/response logging via SDK debug transport
 	// ProjectKeys, when non-empty, limits extraction to these project keys.
 	// The /api/projects/search endpoint filters server-side, so only the
 	// requested projects are fetched and all downstream per-project tasks
@@ -87,6 +92,12 @@ func (e *Executor) SkippedProjectKeys() []string {
 // It returns the list of project keys that were skipped due to insufficient privileges.
 func RunExtract(ctx context.Context, cfg ExtractConfig) ([]string, error) {
 	cfg.applyDefaults()
+
+	cmdStart := time.Now()
+	// End-of-command timing line (#311) — defer so it fires on every
+	// exit path. Logger is slog.Default() so initClient failures
+	// before any per-run logger install still surface the duration.
+	defer common.LogCommandDuration(slog.Default(), "extract", cmdStart)
 
 	client, raw, version, edition, err := initClient(ctx, cfg)
 	if err != nil {
@@ -166,8 +177,8 @@ func buildPlan(cfg ExtractConfig, edition Edition) (map[string]*TaskDef, [][]str
 	registry = FilterByEdition(registry, edition)
 
 	var targets []string
-	if cfg.IncludeScanHistory {
-		targets = TargetTasksWithScanHistory(registry, cfg.TargetTask, cfg.ExtractType)
+	if cfg.IncludeProjectData {
+		targets = TargetTasksWithProjectData(registry, cfg.TargetTask, cfg.ExtractType)
 	} else {
 		targets = TargetTasks(registry, cfg.TargetTask, cfg.ExtractType)
 	}
@@ -219,7 +230,12 @@ func runPhase(ctx context.Context, e *Executor, taskNames []string, registry map
 		def := registry[name]
 		e.Logger.Info("running task", "task", name)
 		g.Go(func() error {
-			if err := def.Run(ctx, e); err != nil {
+			taskStart := time.Now()
+			err := def.Run(ctx, e)
+			// Per-task end-of-run timing line (#311), emitted on
+			// both success and failure paths.
+			common.LogTaskDuration(e.Logger, name, time.Since(taskStart))
+			if err != nil {
 				return fmt.Errorf("task %s: %w", name, err)
 			}
 			return nil

@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package extract
 
 import (
@@ -33,9 +37,9 @@ type configFileShape struct {
 	CertPassword       string `json:"cert_password"`
 	Concurrency        int    `json:"concurrency"`
 	Timeout            int    `json:"timeout"`
-	ExtractID          string `json:"extract_id"`
-	TargetTask         string `json:"target_task"`
-	IncludeScanHistory bool   `json:"include_scan_history"`
+	ExtractID                string `json:"extract_id"`
+	TargetTask               string `json:"target_task"`
+	SkipProjectDataMigration bool   `json:"skip_project_data_migration"`
 
 	// Shape 2 (command-sectioned).
 	Extract *configFileShape `json:"extract"`
@@ -144,6 +148,9 @@ func (s configFileShape) toExtractConfig() ExtractConfig {
 			cfg.Timeout = s.Timeout
 		}
 		cfg.ExportDirectory = s.ExportDirectory
+		// #303: top-level skip_project_data_migration drives whether
+		// the extract pulls issue / source / SCM-blame data.
+		cfg.SkipProjectDataMigration = s.SkipProjectDataMigration
 	case s.SonarQube != nil:
 		cfg.URL = s.SonarQube.URL
 		cfg.Token = s.SonarQube.Token
@@ -152,6 +159,7 @@ func (s configFileShape) toExtractConfig() ExtractConfig {
 			cfg.Concurrency = s.Settings.Concurrency
 			cfg.Timeout = s.Settings.Timeout
 		}
+		cfg.SkipProjectDataMigration = s.SkipProjectDataMigration
 	case s.Extract != nil:
 		return s.Extract.toExtractConfig()
 	default:
@@ -166,7 +174,7 @@ func (s configFileShape) toExtractConfig() ExtractConfig {
 		cfg.Timeout = s.Timeout
 		cfg.ExtractID = s.ExtractID
 		cfg.TargetTask = s.TargetTask
-		cfg.IncludeScanHistory = s.IncludeScanHistory
+		cfg.SkipProjectDataMigration = s.SkipProjectDataMigration
 	}
 	return cfg
 }

@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package migrate
 
 import (
@@ -9,8 +13,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	sqapi "github.com/sonar-solutions/sq-api-go"
 	"github.com/sonar-solutions/sonar-migration-tool/internal/common"
@@ -101,6 +107,70 @@ func TestForEachMigrateItem(t *testing.T) {
 	}
 	if count.Load() != 2 {
 		t.Errorf("expected 2 iterations, got %d", count.Load())
+	}
+}
+
+// Issue #338: forEachMigrateItemSerial must process items one at a
+// time. A barrier inside the per-item callback counts concurrent
+// callers and would record >1 if the helper accidentally fell back
+// to fan-out concurrency.
+func TestForEachMigrateItemSerial(t *testing.T) {
+	dir := t.TempDir()
+	store := common.NewDataStore(dir)
+
+	w, _ := store.Writer("dep")
+	w.WriteChunk([]json.RawMessage{
+		json.RawMessage(`{"key":"a"}`),
+		json.RawMessage(`{"key":"b"}`),
+		json.RawMessage(`{"key":"c"}`),
+		json.RawMessage(`{"key":"d"}`),
+		json.RawMessage(`{"key":"e"}`),
+	})
+
+	e := &Executor{
+		Store:  store,
+		Sem:    make(chan struct{}, 8),
+		Logger: slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
+	}
+
+	var (
+		inFlight    atomic.Int32
+		maxInFlight atomic.Int32
+		order       []string
+		orderMu     sync.Mutex
+	)
+	err := forEachMigrateItemSerial(context.Background(), e, "test", "dep", nil,
+		func(_ context.Context, item json.RawMessage, _ *common.ChunkWriter) error {
+			n := inFlight.Add(1)
+			for {
+				cur := maxInFlight.Load()
+				if n <= cur || maxInFlight.CompareAndSwap(cur, n) {
+					break
+				}
+			}
+			// Hold long enough that any accidental concurrency would
+			// pile up in the gauge.
+			time.Sleep(5 * time.Millisecond)
+			orderMu.Lock()
+			order = append(order, extractField(item, "key"))
+			orderMu.Unlock()
+			inFlight.Add(-1)
+			return nil
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if maxInFlight.Load() != 1 {
+		t.Errorf("expected max in-flight = 1 (serial), got %d", maxInFlight.Load())
+	}
+	wantOrder := []string{"a", "b", "c", "d", "e"}
+	if len(order) != len(wantOrder) {
+		t.Fatalf("expected %d items processed, got %d (%v)", len(wantOrder), len(order), order)
+	}
+	for i, k := range wantOrder {
+		if order[i] != k {
+			t.Errorf("order[%d]: want %s, got %s (full: %v)", i, k, order[i], order)
+		}
 	}
 }
 
@@ -261,7 +331,8 @@ func TestTaskCounterFailAndSummary(t *testing.T) {
 	c.Success()
 	c.Success()
 	c.Fail()
-	c.LogSummary(logger)
+	// #333: LogSummary now carries duration alongside the counts.
+	c.LogSummary(logger, 54139*time.Millisecond)
 
 	output := buf.String()
 	if !strings.Contains(output, "succeeded=2") {
@@ -273,136 +344,218 @@ func TestTaskCounterFailAndSummary(t *testing.T) {
 	if !strings.Contains(output, "total=3") {
 		t.Errorf("expected total=3, got: %s", output)
 	}
+	if !strings.Contains(output, "duration=00:00:54.139") {
+		t.Errorf("expected duration=00:00:54.139 attribute, got: %s", output)
+	}
+	// The combined log must be a single "task summary" line — not two
+	// separate lines (the regression #333 patched).
+	if strings.Count(output, "\n") != 1 {
+		t.Errorf("expected exactly one log line, got: %s", output)
+	}
 }
 
+// #333: an empty counter (no Success/Fail recorded) falls back to the
+// plain "Task X: Duration ..." line so every task still emits exactly
+// one closing log entry.
 func TestTaskCounterEmptySummary(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
 	c := NewTaskCounter("empty")
-	c.LogSummary(logger)
+	c.LogSummary(logger, 250*time.Millisecond)
 
-	if buf.Len() > 0 {
-		t.Errorf("expected no output for empty counter, got: %s", buf.String())
+	output := buf.String()
+	if !strings.Contains(output, "Task empty: Duration 00:00:00.250") {
+		t.Errorf("expected standalone duration line, got: %s", output)
+	}
+	if strings.Contains(output, "succeeded=") {
+		t.Errorf("empty counter should not emit succeeded/failed attrs, got: %s", output)
 	}
 }
+// #300: runProjectSyncLoop applies fn to every item concurrently and
+// emits a "<label>: N/M - X%" progress line every `interval`
+// completions, including a final 100% line at the end of the batch.
+func TestRunProjectSyncLoop(t *testing.T) {
+	t.Run("issue sync cadence at every 20", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		e := &Executor{Sem: make(chan struct{}, 4), Logger: logger}
 
-func TestProgressLoggerZeroInterval(t *testing.T) {
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		items := make([]int, 40)
+		var applied atomic.Int64
+		runProjectSyncLoop(context.Background(), e, items, "Issue sync:", 20,
+			func(_ context.Context, _ int) { applied.Add(1) })
 
-	// total=0 → interval=0 → Increment should be a no-op
-	prog := newProgressLogger(logger, "test", 0)
-	prog.Increment()
-
-	if buf.Len() > 0 {
-		t.Errorf("expected no output for zero-interval progress, got: %s", buf.String())
-	}
-}
-
-func TestProgressLoggerLogsAtInterval(t *testing.T) {
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-
-	// total=50 → interval=50 (< 100 branch)
-	prog := newProgressLogger(logger, "test", 50)
-	for i := range 49 {
-		prog.Increment()
-		if buf.Len() > 0 {
-			t.Fatalf("unexpected log at iteration %d", i)
+		if applied.Load() != 40 {
+			t.Errorf("want apply called 40 times, got %d", applied.Load())
 		}
-	}
-	prog.Increment() // 50th item
-	// Issue #202: message now reads "task N/M - X%" — a single
-	// readable line operators can scan when tailing the log.
-	if !strings.Contains(buf.String(), "test 50/50 - 100%") {
-		t.Errorf("expected progress message \"test 50/50 - 100%%\", got: %s", buf.String())
-	}
+		out := buf.String()
+		if !strings.Contains(out, "Issue sync: 20/40 - 50%") {
+			t.Errorf("missing mid-batch progress line, got:\n%s", out)
+		}
+		if !strings.Contains(out, "Issue sync: 40/40 - 100%") {
+			t.Errorf("missing final 100%% line, got:\n%s", out)
+		}
+	})
+
+	// Issue #348: the production caller (syncProjectIssues) builds
+	// the label as "Project key <cloudKey> issue sync:" so the
+	// operator can disentangle interleaved per-project lines when
+	// several projects sync in parallel.
+	t.Run("issue sync label carries project key (#348)", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		e := &Executor{Sem: make(chan struct{}, 4), Logger: logger}
+
+		const cloudKey = "myorg_some_project_key"
+		label := "Project key " + cloudKey + " issue sync:"
+		items := make([]int, 20)
+		runProjectSyncLoop(context.Background(), e, items, label, 20,
+			func(_ context.Context, _ int) {})
+
+		out := buf.String()
+		want := "Project key myorg_some_project_key issue sync: 20/20 - 100%"
+		if !strings.Contains(out, want) {
+			t.Errorf("want log line %q, got:\n%s", want, out)
+		}
+	})
+
+	t.Run("hotspot sync cadence at every 10", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		e := &Executor{Sem: make(chan struct{}, 4), Logger: logger}
+
+		items := make([]int, 30)
+		runProjectSyncLoop(context.Background(), e, items, "Hotspot sync:", 10,
+			func(_ context.Context, _ int) {})
+
+		out := buf.String()
+		if !strings.Contains(out, "Hotspot sync: 10/30 - 33%") {
+			t.Errorf("missing first cadence line, got:\n%s", out)
+		}
+		if !strings.Contains(out, "Hotspot sync: 30/30 - 100%") {
+			t.Errorf("missing final 100%% line, got:\n%s", out)
+		}
+	})
+
+	t.Run("cancelled context short-circuits remaining work", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		e := &Executor{Sem: make(chan struct{}, 1), Logger: logger}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // pre-cancel so every goroutine sees gctx.Err() != nil
+
+		items := make([]int, 5)
+		var applied atomic.Int64
+		runProjectSyncLoop(ctx, e, items, "Issue sync:", 20,
+			func(_ context.Context, _ int) { applied.Add(1) })
+
+		if applied.Load() != 0 {
+			t.Errorf("cancelled ctx: want 0 apply calls, got %d", applied.Load())
+		}
+	})
+
+	t.Run("empty input does not panic", func(t *testing.T) {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		e := &Executor{Sem: make(chan struct{}, 4), Logger: logger}
+		runProjectSyncLoop(context.Background(), e, []int{}, "Issue sync:", 20,
+			func(_ context.Context, _ int) { t.Fatal("apply should not be called") })
+	})
+}
+// #326: sortMigrateItems orders items by (orgField, sortField) for tasks
+// in the registry, and is a no-op for tasks not in the registry.
+func TestSortMigrateItems(t *testing.T) {
+	t.Run("org-bucketed alphabetical", func(t *testing.T) {
+		items := []json.RawMessage{
+			json.RawMessage(`{"sonarcloud_org_key":"org-b","cloud_project_key":"banana"}`),
+			json.RawMessage(`{"sonarcloud_org_key":"org-a","cloud_project_key":"zebra"}`),
+			json.RawMessage(`{"sonarcloud_org_key":"org-b","cloud_project_key":"apple"}`),
+			json.RawMessage(`{"sonarcloud_org_key":"org-a","cloud_project_key":"alpha"}`),
+		}
+		sortMigrateItems("createProjects", items)
+
+		gotOrgs := make([]string, len(items))
+		gotKeys := make([]string, len(items))
+		for i, it := range items {
+			gotOrgs[i] = extractField(it, "sonarcloud_org_key")
+			gotKeys[i] = extractField(it, "cloud_project_key")
+		}
+		wantOrgs := []string{"org-a", "org-a", "org-b", "org-b"}
+		wantKeys := []string{"alpha", "zebra", "apple", "banana"}
+		for i := range items {
+			if gotOrgs[i] != wantOrgs[i] || gotKeys[i] != wantKeys[i] {
+				t.Errorf("position %d: got (%s, %s), want (%s, %s)",
+					i, gotOrgs[i], gotKeys[i], wantOrgs[i], wantKeys[i])
+			}
+		}
+	})
+
+	t.Run("enterprise-wide alphabetical (no org bucketing)", func(t *testing.T) {
+		items := []json.RawMessage{
+			json.RawMessage(`{"name":"Charlie"}`),
+			json.RawMessage(`{"name":"Alice"}`),
+			json.RawMessage(`{"name":"Bob"}`),
+		}
+		sortMigrateItems("configurePortfolios", items)
+		want := []string{"Alice", "Bob", "Charlie"}
+		for i, it := range items {
+			if got := extractField(it, "name"); got != want[i] {
+				t.Errorf("position %d: got %s, want %s", i, got, want[i])
+			}
+		}
+	})
+
+	t.Run("unregistered task is a no-op", func(t *testing.T) {
+		items := []json.RawMessage{
+			json.RawMessage(`{"name":"Charlie"}`),
+			json.RawMessage(`{"name":"Alice"}`),
+			json.RawMessage(`{"name":"Bob"}`),
+		}
+		sortMigrateItems("notInRegistry", items)
+		// Order preserved exactly.
+		want := []string{"Charlie", "Alice", "Bob"}
+		for i, it := range items {
+			if got := extractField(it, "name"); got != want[i] {
+				t.Errorf("position %d: got %s, want %s (sort should be no-op)", i, got, want[i])
+			}
+		}
+	})
+
+	t.Run("empty input does not panic", func(t *testing.T) {
+		sortMigrateItems("createProjects", nil)
+		sortMigrateItems("createProjects", []json.RawMessage{})
+	})
 }
 
-// The final-item log MUST fire even when total isn't a clean
-// multiple of the interval — e.g. createProjects with 975 items at
-// every-10 logs at 970 then jumps to 975 with a 100% line. Issue
-// #202 spec calls this out explicitly: operators need an explicit
-// "task complete" marker.
-func TestProgressLoggerFiresFinalHundredPercent(t *testing.T) {
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	prog := newProgressLogger(logger, "createProjects", 975) // interval=10
+// #326: sortExtractItems orders extract items by the spec's sortField.
+// Extract records don't carry orgField, so any spec.orgField is ignored
+// at this layer.
+func TestSortExtractItems(t *testing.T) {
+	t.Run("alphabetical by sort field", func(t *testing.T) {
+		items := []structure.ExtractItem{
+			{Data: json.RawMessage(`{"projectKey":"omega"}`)},
+			{Data: json.RawMessage(`{"projectKey":"alpha"}`)},
+			{Data: json.RawMessage(`{"projectKey":"mu"}`)},
+		}
+		sortExtractItems("setProjectSettings", items)
+		want := []string{"alpha", "mu", "omega"}
+		for i, it := range items {
+			if got := extractField(it.Data, "projectKey"); got != want[i] {
+				t.Errorf("position %d: got %s, want %s", i, got, want[i])
+			}
+		}
+	})
 
-	for i := 0; i < 975; i++ {
-		prog.Increment()
-	}
-	out := buf.String()
-	// Last regularly-scheduled line lands at 970 (interval × 97).
-	if !strings.Contains(out, "createProjects 970/975 - 99%") {
-		t.Errorf("expected interval-aligned line at 970, got:\n%s", out)
-	}
-	// Final line at 975 — fires because (n == total) even though
-	// 975 isn't a multiple of 10.
-	if !strings.Contains(out, "createProjects 975/975 - 100%") {
-		t.Errorf("expected final 100%% line at 975, got:\n%s", out)
-	}
-}
-
-// Per-task interval overrides take precedence over the size-based
-// default. createProjects ships at every-10, setProjectGroupPermissions
-// at every-100 (issue #202).
-func TestProgressLoggerHonoursPerTaskInterval(t *testing.T) {
-	cases := []struct {
-		task          string
-		total         int
-		wantInterval  int64
-		wantFirstAt   int // iteration count when the first log should fire
-		wantFirstLine string
-	}{
-		{
-			task:          "createProjects",
-			total:         975,
-			wantInterval:  10,
-			wantFirstAt:   10,
-			wantFirstLine: "createProjects 10/975 - 1%",
-		},
-		{
-			task:          "configurePortfolios",
-			total:         87,
-			wantInterval:  10,
-			wantFirstAt:   10,
-			wantFirstLine: "configurePortfolios 10/87 - 11%",
-		},
-		{
-			task:          "setProjectSettings",
-			total:         1234,
-			wantInterval:  50,
-			wantFirstAt:   50,
-			wantFirstLine: "setProjectSettings 50/1234 - 4%",
-		},
-		{
-			task:          "setProjectGroupPermissions",
-			total:         19778,
-			wantInterval:  100,
-			wantFirstAt:   100,
-			wantFirstLine: "setProjectGroupPermissions 100/19778 - 0%",
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.task, func(t *testing.T) {
-			var buf bytes.Buffer
-			logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
-			prog := newProgressLogger(logger, c.task, c.total)
-			if prog.interval != c.wantInterval {
-				t.Errorf("interval: want %d, got %d", c.wantInterval, prog.interval)
-			}
-			for i := 0; i < c.wantFirstAt-1; i++ {
-				prog.Increment()
-				if buf.Len() > 0 {
-					t.Fatalf("unexpected log at iteration %d for %s", i, c.task)
-				}
-			}
-			prog.Increment() // first interval hit
-			if !strings.Contains(buf.String(), c.wantFirstLine) {
-				t.Errorf("want first log to contain %q, got: %s", c.wantFirstLine, buf.String())
-			}
-		})
-	}
+	t.Run("unregistered task is a no-op", func(t *testing.T) {
+		items := []structure.ExtractItem{
+			{Data: json.RawMessage(`{"projectKey":"omega"}`)},
+			{Data: json.RawMessage(`{"projectKey":"alpha"}`)},
+		}
+		sortExtractItems("notInRegistry", items)
+		if extractField(items[0].Data, "projectKey") != "omega" {
+			t.Errorf("expected input order preserved for unregistered task")
+		}
+	})
 }

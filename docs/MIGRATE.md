@@ -120,7 +120,7 @@ sonar-migration-tool extract <URL> <TOKEN> --export_directory ./files/ [--concur
 | `--timeout` | Request timeout in seconds |
 | `--extract_type` | Type of extract to run |
 | `--export_directory` | Output directory (default: `./migration-files`) |
-| `--include_scan_history` | Extract full issue data, source code, and SCM blame for scan history import |
+| `--skip_project_data_migration` | Skip the issue / source / SCM-blame extract (project data is extracted by default) |
 | `--pem_file_path` | Client certificate PEM file (mTLS) |
 | `--key_file_path` | Client certificate key file (mTLS) |
 | `--cert_password` | Client certificate password (mTLS) |
@@ -308,7 +308,7 @@ sonar-migration-tool reset <TOKEN> <ENTERPRISE_KEY> --export_directory ./files/
 
 1. Verify projects appear in SonarQube Cloud and are linked to repositories.
 2. Verify quality gates and profiles are correct.
-3. Re-scan all projects — unless scan history was imported, historical data does not transfer.
+3. Re-scan all projects — unless project data was imported, historical data does not transfer.
 4. Update CI/CD pipelines to point to SonarQube Cloud (`SONAR_TOKEN` and `SONAR_HOST_URL`).
 5. Generate a final report for the records:
    ```bash
@@ -332,6 +332,7 @@ sonar-migration-tool reset <TOKEN> <ENTERPRISE_KEY> --export_directory ./files/
 ---
 
 ## Output files reference
+<!-- updated: 2026-06-05_14:00:00 -->
 
 | File | Description |
 |---|---|
@@ -346,6 +347,10 @@ sonar-migration-tool reset <TOKEN> <ENTERPRISE_KEY> --export_directory ./files/
 | `templates.csv` | Permission Template mappings |
 | `portfolios.csv` | Portfolio mappings |
 | `predictive_migration_summary.pdf` | Output of the `predictive-report` command |
+| `migration_summary.pdf` | Migration summary (PDF), written to the run directory on completion |
+| `migration_summary.md` | Migration summary (Markdown), written alongside the PDF on completion |
+| `run_meta.json` | Per-phase / per-task timing and `overall_status` (`success` \| `partial` \| `failed`); written on completion, including failed runs |
+| `run_events.jsonl` | JSON Lines stream of run events mirrored from the logger by the tee slog handler; parsed by the summary collector |
 | `<export_directory>/<run_id>/requests.log` | Per-run request log for migrations |
 
 ---

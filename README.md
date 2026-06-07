@@ -8,7 +8,7 @@ The tool ships as a single static binary. No installer, no runtime dependencies.
 ---
 
 ## What gets migrated
-<!-- updated: 2026-06-04_01:13:00.000 by Claude -->
+<!-- updated: 2026-06-05_19:25:00 -->
 
 | ✅ Migrated | ❌ NOT migrated |
 |---|---|
@@ -16,9 +16,10 @@ The tool ships as a single static binary. No installer, no runtime dependencies.
 | Groups, Permissions, Permission Templates | CI/CD pipeline configuration (update `SONAR_HOST_URL` manually) |
 | Project Settings, Webhooks, Links | |
 | Portfolios (Enterprise) | |
-| **Issues & Hotspots** with status, comments, and tags (via `--include-scan-history`) | |
-| **Source Code** and measures (via `--include-scan-history`) | |
-| **Issue Creation Dates** preserved via BackdateChangesets (via `--include-scan-history`) | |
+| **Issues & Hotspots** with status, comments, and tags (project data, on by default) | |
+| **Source Code** and measures (project data, on by default) | |
+| **Issue Creation Dates** preserved via BackdateChangesets (project data, on by default) | |
+| **All branches** — non-main branches migrate as long-lived branches with full issue history (project data, on by default) | |
 
 ---
 
@@ -83,17 +84,28 @@ The tool ships with several commands. Pick the workflow that matches your situat
 
 Use `transfer`. It runs the whole migration in a single command — extracting from SonarQube Server, mapping the configuration, importing source code and issues, and pushing everything to SonarQube Cloud — then writes a PDF summary you can hand to your team.
 
+`transfer` shares the same `--config` file and the same direction-neutral CLI flags as `extract` / `migrate` / `reset` — `--source_*` for the SonarQube Server side, `--target_*` for the SonarQube Cloud side. Anything you don't pass on the CLI is read from the config file; CLI flags always win.
+
 ```bash
 ./sonar-migration-tool transfer \
-  --sq-url https://sonarqube.example.com \
-  --sq-token sqp_xxx \
-  --project-key my-project \
-  --sc-token squ_xxx \
-  --sc-org my-org \
-  --include-scan-history
+  --source_url https://sonarqube.example.com \
+  --source_token sqp_xxx \
+  --project_key my-project \
+  --target_token squ_xxx \
+  --default_organization my-org
 ```
 
-Add `--sc-url` to target a different SonarQube Cloud instance (e.g. `--sc-url https://sc-staging.io` for staging).
+Or use a **config file** to keep tokens out of your shell history:
+
+```bash
+cp examples/config-transfer.example.json my-config.json
+# Edit my-config.json with your SonarQube Server and SonarQube Cloud credentials
+./sonar-migration-tool transfer -c my-config.json --project_key my-project
+```
+
+The config file uses the same unified shape as every other command — one top-level block of shared defaults plus `source` and `target` sub-objects. `concurrency`, `timeout`, `export_directory`, mTLS (`pem_file_path` / `key_file_path` / `cert_password`), and `--default_organization` / `--enterprise_key` are all honored either via the JSON file or as CLI overrides.
+
+Add `--target_url` to target a different SonarQube Cloud instance (e.g. `--target_url https://sc-staging.io` for staging).
 
 Full reference, more examples, and the config-file format:
 👉 **[Using `transfer` — Transfer One Project](docs/TRANSFER.md)**
@@ -109,6 +121,17 @@ Use `migrate` together with the underlying `extract` / `structure` / `mappings` 
 ./sonar-migration-tool structure
 ./sonar-migration-tool mappings
 ./sonar-migration-tool migrate <SC_TOKEN> <SC_ENTERPRISE_KEY>
+```
+
+Or use a **config file** for extract and migrate:
+
+```bash
+cp examples/config.unified.example.json my-config.json
+# Edit my-config.json with your source (SonarQube Server) and target (SonarQube Cloud) credentials
+./sonar-migration-tool extract --config my-config.json
+./sonar-migration-tool structure --config my-config.json
+./sonar-migration-tool mappings --config my-config.json
+./sonar-migration-tool migrate --config my-config.json
 ```
 
 Full reference, flags, multi-server migration, and resume support:
@@ -135,8 +158,8 @@ Once the command finishes:
 1. Log in to [sonarcloud.io](https://sonarcloud.io).
 2. Open the target organization.
 3. Spot-check that your project(s) are listed and the quality gate and quality profile are correct.
-4. If you used `--include-scan-history`, verify that issues, hotspots, and their creation dates match the source. You can also run `./sonar-migration-tool regtest` for automated verification.
-5. **Re-scan your projects in CI** to seed ongoing analysis. If you did *not* use `--include-scan-history`, this first scan will be the baseline for all issue tracking.
+4. Unless you passed `--skip_project_data_migration`, verify that issues, hotspots, and their creation dates match the source — and that non-main branches appear under **Branches** with their issues. You can also run `./sonar-migration-tool regtest` for automated verification.
+5. **Re-scan your projects in CI** to seed ongoing analysis. If you used `--skip_project_data_migration`, this first scan will be the baseline for all issue tracking.
 6. Update your CI/CD pipeline to point at SonarQube Cloud (`SONAR_TOKEN` and `SONAR_HOST_URL`).
 
 For the full post-migration checklist, see [After you migrate](docs/MIGRATE.md#after-you-migrate) in the MIGRATE guide.

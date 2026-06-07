@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package cmd
 
 import (
@@ -25,12 +29,18 @@ organization keys to organizations.csv.`,
 			return fmt.Errorf("TOKEN and ENTERPRISE_KEY are required (either as arguments or in config file)")
 		}
 		runID, err := migrate.RunMigrate(cmd.Context(), cfg)
+		// Attempt the summary report whenever a run directory exists, even
+		// if RunMigrate returned an error — a partial/failed run still has
+		// useful timings, failures, and warnings to surface.
+		if runID != "" {
+			runDir := filepath.Join(cfg.ExportDirectory, runID)
+			if pdfPath, mdPath, reportErr := summary.GenerateReports(runDir, cfg.ExportDirectory, cfg.ExportDirectory); reportErr == nil {
+				fmt.Printf("PDF summary report: %s\n", pdfPath)
+				fmt.Printf("Markdown summary report: %s\n", mdPath)
+			}
+		}
 		if err != nil {
 			return err
-		}
-		runDir := filepath.Join(cfg.ExportDirectory, runID)
-		if pdfPath, pdfErr := summary.GeneratePDFReport(runDir, cfg.ExportDirectory, cfg.ExportDirectory); pdfErr == nil {
-			fmt.Printf("PDF summary report: %s\n", pdfPath)
 		}
 		printExportDirNotice(cfg.ExportDirectory)
 		return nil
@@ -47,8 +57,10 @@ func init() {
 	f.String("export_directory", "", "Root directory containing all SonarQube exports")
 	f.String("target_task", "", "Name of a specific migration task to complete")
 	f.Bool("skip_profiles", false, "Skip quality profile migration/provisioning in SonarQube Cloud")
-	f.Bool("include_scan_history", false, "Import scan history (issues, metrics) into SonarQube Cloud projects")
+	f.Bool(flagSkipIssueSync, false, "Skip the final per-issue and per-hotspot metadata sync (#299). Same semantics as the skip_issue_sync config-file field — defaults to false (sync happens); pass the flag to skip.")
+	f.Bool(flagSkipProjectDataMigration, false, "Skip the entire project-data migration: importProjectData and the trailing per-issue/per-hotspot sync (#303). Defaults to false (data is migrated); pass the flag to skip.")
 	f.String("default_organization", "", "SonarQube Cloud organization to migrate every project into when organizations.csv has no mapping defined. Ignored if any mapping is present.")
+	f.StringSlice("exclude_branches", nil, "Glob patterns for non-main branches to skip during project data import (e.g. feature/*,bugfix/*)")
 }
 
 func buildMigrateConfig(cmd *cobra.Command, args []string) (migrate.MigrateConfig, error) {
@@ -84,11 +96,30 @@ func buildMigrateConfig(cmd *cobra.Command, args []string) (migrate.MigrateConfi
 	if cmd.Flags().Changed("skip_profiles") {
 		cfg.SkipProfiles, _ = cmd.Flags().GetBool("skip_profiles")
 	}
-	if cmd.Flags().Changed("include_scan_history") {
-		cfg.IncludeScanHistory, _ = cmd.Flags().GetBool("include_scan_history")
+	// --skip_issue_sync explicitly turns off the trailing sync. The
+	// flag always wins over the config-file skip_issue_sync field.
+	// One-way: --skip_issue_sync=false on the CLI does NOT undo a
+	// config-file skip_issue_sync: true.
+	if cmd.Flags().Changed(flagSkipIssueSync) {
+		v, _ := cmd.Flags().GetBool(flagSkipIssueSync)
+		if v {
+			cfg.SkipIssueSync = true
+		}
+	}
+	// --skip_project_data_migration is the wider opt-out: it covers
+	// importProjectData AND the trailing sync pair. Same one-way
+	// override semantics. #303.
+	if cmd.Flags().Changed(flagSkipProjectDataMigration) {
+		v, _ := cmd.Flags().GetBool(flagSkipProjectDataMigration)
+		if v {
+			cfg.SkipProjectDataMigration = true
+		}
 	}
 	if cmd.Flags().Changed("debug") {
 		cfg.Debug, _ = cmd.Flags().GetBool("debug")
+	}
+	if cmd.Flags().Changed("exclude_branches") {
+		cfg.ExcludeBranches, _ = cmd.Flags().GetStringSlice("exclude_branches")
 	}
 
 	// Default the export directory when neither config nor flag supplied
@@ -96,6 +127,12 @@ func buildMigrateConfig(cmd *cobra.Command, args []string) (migrate.MigrateConfi
 	if cfg.ExportDirectory == "" {
 		cfg.ExportDirectory = DefaultExportDirectory
 	}
+
+	// Project-data migration is on by default; the only opt-out is
+	// SkipProjectDataMigration. Derive the internal IncludeProjectData
+	// field so the planner's existing project-data gate keeps working
+	// without forcing every caller to set both fields.
+	cfg.IncludeProjectData = !cfg.SkipProjectDataMigration
 
 	return cfg, nil
 }

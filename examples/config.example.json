@@ -24,6 +24,8 @@
     "export_directory": "./files",
     "concurrency": 10,
     "run_id": null,
-    "target_task": null
+    "target_task": null,
+    "skip_issue_sync": false,
+    "skip_project_data_migration": false
   }
 }

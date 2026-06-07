@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package scanreport
 
 import (
@@ -65,6 +69,36 @@ func TestBuildMetadata(t *testing.T) {
 	goProfile := md.QprofilesPerLanguage["go"]
 	if goProfile == nil || goProfile.Key != "qp1" {
 		t.Error("expected go qprofile with key qp1")
+	}
+}
+
+// TestBuildMetadataReferenceBranch locks in the field-11 (reference/merge
+// branch) behavior that lets the SonarCloud CE accept non-main branch reports.
+// A non-main branch must reference the MAIN branch (so the CE copies issues
+// from it); when no reference is supplied (the main branch's own analysis) the
+// field falls back to the branch's own name, which is harmless because the main
+// branch sends no branch characteristic.
+func TestBuildMetadataReferenceBranch(t *testing.T) {
+	// Non-main branch: reference is the main branch, not itself.
+	nonMain := BuildMetadata(MetadataInput{
+		BranchName:          "develop",
+		BranchType:          pb.Metadata_BRANCH,
+		ReferenceBranchName: "master",
+	}, 1)
+	if nonMain.ReferenceBranchName != "master" {
+		t.Errorf("non-main reference: want master, got %q", nonMain.ReferenceBranchName)
+	}
+	if nonMain.BranchName != "develop" {
+		t.Errorf("non-main branch name must stay develop, got %q", nonMain.BranchName)
+	}
+
+	// Main branch (no reference supplied): falls back to its own name.
+	main := BuildMetadata(MetadataInput{
+		BranchName: "master",
+		BranchType: pb.Metadata_BRANCH,
+	}, 1)
+	if main.ReferenceBranchName != "master" {
+		t.Errorf("unset reference falls back to branch name: want master, got %q", main.ReferenceBranchName)
 	}
 }
 
@@ -177,7 +211,8 @@ func TestBuildActiveRules(t *testing.T) {
 		{RuleRepo: "java", RuleKey: "S5678", Severity: "BLOCKER", QProfileKey: "qp2"},
 	}
 
-	result := BuildActiveRules(rules)
+	const ts = int64(1700000000000)
+	result := BuildActiveRules(rules, ts)
 	if len(result) != 2 {
 		t.Fatalf("expected 2 rules, got %d", len(result))
 	}
@@ -186,6 +221,14 @@ func TestBuildActiveRules(t *testing.T) {
 	}
 	if result[1].Severity != pb.Severity_BLOCKER {
 		t.Errorf("expected BLOCKER severity, got %v", result[1].Severity)
+	}
+	// The reference scanner always sets a non-nil params map and non-zero
+	// timestamps; verify our mirror does too.
+	if result[0].ParamsByKey == nil {
+		t.Error("expected non-nil ParamsByKey")
+	}
+	if result[0].CreatedAt != ts || result[0].UpdatedAt != ts {
+		t.Errorf("expected createdAt/updatedAt to default to %d, got %d/%d", ts, result[0].CreatedAt, result[0].UpdatedAt)
 	}
 }
 

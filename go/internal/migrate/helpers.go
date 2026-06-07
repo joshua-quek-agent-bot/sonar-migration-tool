@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package migrate
 
 import (
@@ -6,13 +10,94 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync/atomic"
+	"time"
 
 	sqapi "github.com/sonar-solutions/sq-api-go"
 	"github.com/sonar-solutions/sonar-migration-tool/internal/common"
 	"github.com/sonar-solutions/sonar-migration-tool/internal/structure"
 	"golang.org/x/sync/errgroup"
 )
+
+// sortSpec describes how a task's items should be ordered before iteration
+// (#326). orgField names the JSON field used to bucket items by SonarCloud
+// org so each org's objects are processed contiguously — empty means
+// enterprise-wide, no bucketing. sortField names the JSON field used to
+// alphabetize items within each bucket.
+type sortSpec struct {
+	orgField  string
+	sortField string
+}
+
+// taskSortSpecs registers per-task ordering for the centralized iteration
+// helpers. Tasks not listed here keep their input order (no-op sort).
+//
+// Within each entry the chosen sortField is the operator-visible identifier:
+// project key for projects, name for groups / profiles / gates / portfolios
+// / permission templates. Org-scoped objects are bucketed by
+// sonarcloud_org_key first; portfolios are enterprise-wide so they sort
+// purely by name. Extract-driven tasks read records that don't carry the
+// org key, so they sort by projectKey alone — the within-org alphabetical
+// order is preserved as a sub-sequence.
+var taskSortSpecs = map[string]sortSpec{
+	// Migrate-driven (records carry sonarcloud_org_key).
+	"createProjects":            {orgField: "sonarcloud_org_key", sortField: "cloud_project_key"},
+	"setProjectGates":           {orgField: "sonarcloud_org_key", sortField: "cloud_project_key"},
+	"setProjectBinding":         {orgField: "sonarcloud_org_key", sortField: "cloud_project_key"},
+	"createProfiles":            {orgField: "sonarcloud_org_key", sortField: "name"},
+	"createGates":               {orgField: "sonarcloud_org_key", sortField: "name"},
+	"createGroups":              {orgField: "sonarcloud_org_key", sortField: "name"},
+	"createPermissionTemplates": {orgField: "sonarcloud_org_key", sortField: "name"},
+	"setDefaultProfiles":        {orgField: "sonarcloud_org_key", sortField: "name"},
+	"setDefaultGates":           {orgField: "sonarcloud_org_key", sortField: "name"},
+	"setDefaultTemplates":       {orgField: "sonarcloud_org_key", sortField: "name"},
+	"syncIssueMetadata":         {orgField: "sonarcloud_org_key", sortField: "cloud_project_key"},
+	"syncHotspotMetadata":       {orgField: "sonarcloud_org_key", sortField: "cloud_project_key"},
+	"importProjectData":         {orgField: "sonarcloud_org_key", sortField: "cloud_project_key"},
+	// Enterprise-wide (no org bucketing).
+	"createPortfolios":    {sortField: "name"},
+	"configurePortfolios": {sortField: "name"},
+	// Extract-driven tasks: records carry projectKey but no org key.
+	"setProjectProfiles":         {sortField: "projectKey"},
+	"setProjectGroupPermissions": {sortField: "projectKey"},
+	"setProjectSettings":         {sortField: "projectKey"},
+	"setProjectTags":             {sortField: "projectKey"},
+	"setProjectLinks":            {sortField: "projectKey"},
+	"setProjectWebhooks":         {sortField: "projectKey"},
+	"setNewCodePeriods":          {sortField: "projectKey"},
+}
+
+// sortMigrateItems orders items per the task's sortSpec. Stable, in-place;
+// a no-op for tasks without a spec.
+func sortMigrateItems(taskName string, items []json.RawMessage) {
+	spec, ok := taskSortSpecs[taskName]
+	if !ok {
+		return
+	}
+	slices.SortStableFunc(items, func(a, b json.RawMessage) int {
+		if spec.orgField != "" {
+			if c := strings.Compare(extractField(a, spec.orgField), extractField(b, spec.orgField)); c != 0 {
+				return c
+			}
+		}
+		return strings.Compare(extractField(a, spec.sortField), extractField(b, spec.sortField))
+	})
+}
+
+// sortExtractItems orders extract items per the task's sortSpec. Stable,
+// in-place; a no-op for tasks without a spec. Extract records don't carry
+// the org key, so spec.orgField (when set) is ignored here.
+func sortExtractItems(taskName string, items []structure.ExtractItem) {
+	spec, ok := taskSortSpecs[taskName]
+	if !ok {
+		return
+	}
+	slices.SortStableFunc(items, func(a, b structure.ExtractItem) int {
+		return strings.Compare(extractField(a.Data, spec.sortField), extractField(b.Data, spec.sortField))
+	})
+}
 
 // readExtractItems reads JSONL items from an extract task across all extract runs.
 func readExtractItems(e *Executor, taskKey string) ([]structure.ExtractItem, error) {
@@ -32,6 +117,31 @@ func forEachMigrateItemFiltered(ctx context.Context, e *Executor, taskName, depT
 	filterFn func(json.RawMessage) bool,
 	fn func(ctx context.Context, item json.RawMessage, w *common.ChunkWriter) error) error {
 
+	return forEachMigrateItemImpl(ctx, e, taskName, depTask, filterFn, cap(e.Sem), fn)
+}
+
+// forEachMigrateItemSerial is forEachMigrateItemFiltered with concurrency
+// pinned to 1, so each item is fully processed before the next starts.
+// Used by createProfiles (#338): SonarCloud quality-profile creation is
+// asynchronous but the name must be unique, so two parallel POSTs for
+// the same (name, language) can both succeed at the API layer and then
+// fail the uniqueness check at the database layer. Serial processing
+// is cheap — typical migrations create <30 profiles.
+func forEachMigrateItemSerial(ctx context.Context, e *Executor, taskName, depTask string,
+	filterFn func(json.RawMessage) bool,
+	fn func(ctx context.Context, item json.RawMessage, w *common.ChunkWriter) error) error {
+
+	return forEachMigrateItemImpl(ctx, e, taskName, depTask, filterFn, 1, fn)
+}
+
+// forEachMigrateItemImpl is the shared body that backs the concurrent
+// and serial migrate iterators. `concurrency` is the errgroup limit
+// (pass 1 to serialize, or cap(e.Sem) for the default fan-out).
+func forEachMigrateItemImpl(ctx context.Context, e *Executor, taskName, depTask string,
+	filterFn func(json.RawMessage) bool,
+	concurrency int,
+	fn func(ctx context.Context, item json.RawMessage, w *common.ChunkWriter) error) error {
+
 	items, err := e.Store.ReadAll(depTask)
 	if err != nil {
 		return fmt.Errorf("%s: reading %s: %w", taskName, depTask, err)
@@ -45,8 +155,12 @@ func forEachMigrateItemFiltered(ctx context.Context, e *Executor, taskName, depT
 		}
 	}
 
+	// Order items so the log stream reflects alphabetical progress within
+	// each org (#326). No-op for tasks not in the sort registry.
+	sortMigrateItems(taskName, filtered)
+
 	e.Logger.Info("starting task", "task", taskName, "items", len(filtered))
-	prog := newProgressLogger(e.Logger, taskName, len(filtered))
+	prog := common.NewProgressLogger(e.Logger, taskName, len(filtered))
 
 	w, err := e.Store.Writer(taskName)
 	if err != nil {
@@ -54,7 +168,7 @@ func forEachMigrateItemFiltered(ctx context.Context, e *Executor, taskName, depT
 	}
 
 	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(cap(e.Sem))
+	g.SetLimit(concurrency)
 	for _, item := range filtered {
 		g.Go(func() error {
 			if ctx.Err() != nil {
@@ -79,8 +193,12 @@ func forEachExtractItem(ctx context.Context, e *Executor, taskName, extractKey s
 		return fmt.Errorf("%s: reading %s: %w", taskName, extractKey, err)
 	}
 
+	// Order items so the log stream reflects alphabetical progress (#326).
+	// No-op for tasks not in the sort registry.
+	sortExtractItems(taskName, items)
+
 	e.Logger.Info("starting task", "task", taskName, "items", len(items))
-	prog := newProgressLogger(e.Logger, taskName, len(items))
+	prog := common.NewProgressLogger(e.Logger, taskName, len(items))
 
 	w, err := e.Store.Writer(taskName)
 	if err != nil {
@@ -218,17 +336,45 @@ func NewTaskCounter(task string) *TaskCounter {
 	return &TaskCounter{task: task}
 }
 
+// taskCounterCtxKey scopes the per-task counter inside the task's
+// context (#333). runPhase injects a fresh counter so the merged
+// "task summary" log can be emitted from a single place after the
+// task returns.
+type taskCounterCtxKey struct{}
+
+// WithTaskCounter returns a child context carrying the given counter.
+func WithTaskCounter(ctx context.Context, c *TaskCounter) context.Context {
+	return context.WithValue(ctx, taskCounterCtxKey{}, c)
+}
+
+// TaskCounterFromContext returns the counter injected by runPhase, or
+// a throwaway counter if none is present (so tests and ad-hoc Run
+// invocations that bypass runPhase still compile and run).
+func TaskCounterFromContext(ctx context.Context) *TaskCounter {
+	if c, ok := ctx.Value(taskCounterCtxKey{}).(*TaskCounter); ok && c != nil {
+		return c
+	}
+	return NewTaskCounter("")
+}
+
 // Success increments the success count.
 func (c *TaskCounter) Success() { c.succeeded.Add(1) }
 
 // Fail increments the failure count.
 func (c *TaskCounter) Fail() { c.failed.Add(1) }
 
-// LogSummary logs the final counts. Only logs if there were any operations.
-func (c *TaskCounter) LogSummary(logger *slog.Logger) {
+// LogSummary emits the end-of-task INFO log. When the counter saw at
+// least one Success/Fail it logs a "task summary" line that carries
+// both the counts and the elapsed duration (#333 — merged from the
+// previously-separate "Task X: Duration ..." line). When the counter
+// is empty (setup-style tasks that don't track per-item outcomes), it
+// falls back to the plain duration line so every task still ends with
+// exactly one closing log entry.
+func (c *TaskCounter) LogSummary(logger *slog.Logger, duration time.Duration) {
 	s, f := c.succeeded.Load(), c.failed.Load()
 	total := s + f
 	if total == 0 {
+		common.LogTaskDuration(logger, c.task, duration)
 		return
 	}
 	logger.Info("task summary",
@@ -236,76 +382,39 @@ func (c *TaskCounter) LogSummary(logger *slog.Logger) {
 		"succeeded", s,
 		"failed", f,
 		"total", total,
+		"duration", common.FormatHMSMillis(duration),
 	)
 }
 
-// progressLogger logs progress at regular intervals. Safe for concurrent use.
-type progressLogger struct {
-	task     string
-	total    int
-	done     atomic.Int64
-	logger   *slog.Logger
-	interval int64
-}
+// Progress logging is shared with the extract package via
+// common.ProgressLogger (moved out of this file in #340 so the same
+// helper covers both extract and migrate tasks).
 
-// progressLogInterval names how often (in items) the progress logger
-// should emit an INFO line for a given task. Per-task entries take
-// precedence over the size-based fallback in newProgressLogger.
-//
-// Tuned for operator-visible cadence (issue #202):
-//   - createProjects is one API call per project and the slowest
-//     per-item task on large platforms; surface progress every 10.
-//   - configurePortfolios issues multiple Enterprise-API calls per
-//     portfolio (create + update + project membership); every 10
-//     keeps progress visible at the user's expected cadence.
-//   - setProjectSettings does multiple HTTP calls per record on
-//     average (definition-driven dispatch, fan-out fallback);
-//     every 50 strikes a balance between visibility and noise.
-//   - setProjectGroupPermissions can run into the tens of thousands
-//     of items (projects × groups × permissions); every 100 keeps
-//     the log readable while still ticking visibly.
-var progressLogInterval = map[string]int64{
-	"createProjects":             10,
-	"configurePortfolios":        10,
-	"setProjectSettings":         50,
-	"setProjectGroupPermissions": 100,
-}
-
-func newProgressLogger(logger *slog.Logger, task string, total int) *progressLogger {
-	interval := int64(1000)
-	if total < 1000 {
-		interval = 100
+// runProjectSyncLoop applies fn concurrently to every item in items,
+// bounded by e.Sem, emitting a "<label> n/total - x%" progress line
+// every `interval` completions (#300). Per-item errors are not
+// propagated — the caller's `apply` is responsible for logging and
+// counter bookkeeping. Used by syncProjectIssues / syncProjectHotspots
+// to share the actionable-pair iteration shape exactly.
+func runProjectSyncLoop[T any](
+	ctx context.Context, e *Executor,
+	items []T, label string, interval int64,
+	apply func(ctx context.Context, item T),
+) {
+	prog := common.NewProgressLoggerWithInterval(e.Logger, label, len(items), interval)
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(cap(e.Sem))
+	for _, item := range items {
+		g.Go(func() error {
+			if gctx.Err() != nil {
+				return nil
+			}
+			apply(gctx, item)
+			prog.Increment()
+			return nil
+		})
 	}
-	if total < 100 {
-		interval = int64(total)
-	}
-	// Per-task override beats the size-based default — operator
-	// cadence trumps "log volume." Capped at total so the very last
-	// item still emits a line when override > total.
-	if explicit, ok := progressLogInterval[task]; ok && explicit > 0 {
-		interval = explicit
-		if int64(total) < interval {
-			interval = int64(total)
-		}
-	}
-	return &progressLogger{task: task, total: total, logger: logger, interval: interval}
-}
-
-func (p *progressLogger) Increment() {
-	if p.interval <= 0 {
-		return
-	}
-	n := p.done.Add(1)
-	if n%p.interval == 0 || int(n) == p.total {
-		percent := 0
-		if p.total > 0 {
-			percent = int(n * 100 / int64(p.total))
-		}
-		// One-line human-readable message per the issue #202 spec
-		// — "task N/M - X%" — so operators tailing the log can read
-		// progress at a glance.
-		p.logger.Info(fmt.Sprintf("%s %d/%d - %d%%", p.task, n, p.total, percent))
-	}
+	_ = g.Wait()
 }
 
 // extractField is a convenience alias.

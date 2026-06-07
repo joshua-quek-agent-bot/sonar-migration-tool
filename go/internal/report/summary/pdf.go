@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package summary
 
 import (
@@ -111,6 +115,10 @@ func RenderPDF(summary *MigrationSummary) ([]byte, error) {
 	pdf.AddPage()
 	renderTitlePage(pdf, summary)
 
+	if summary.RateLimit != nil {
+		renderRateLimitWarning(pdf, summary.RateLimit)
+	}
+
 	for _, section := range summary.Sections {
 		if summary.OmitSections[section.Name] {
 			continue
@@ -119,6 +127,16 @@ func RenderPDF(summary *MigrationSummary) ([]byte, error) {
 	}
 
 	renderLimitations(pdf, summary.Limitations, summary.Predictive)
+
+	// Runtime telemetry sections (#240+). Each renderer no-ops when its
+	// input is empty / zero, so predictive reports — which never populate
+	// these fields — are completely unaffected. Rendered in this fixed
+	// order after the limitations section.
+	renderRunMetadata(pdf, summary)
+	renderBottlenecks(pdf, summary)
+	renderFailureLedger(pdf, summary)
+	renderWarningsLedger(pdf, summary)
+	renderBranchProjectData(pdf, summary)
 
 	var buf bytes.Buffer
 	if err := pdf.Output(&buf); err != nil {
@@ -485,7 +503,9 @@ var sectionsWithoutOrganization = map[string]bool{
 }
 
 // renderUnifiedTable renders the per-section table:
-//   Name | Organization | Outcome (colored) | Details
+//
+//	Name | Organization | Outcome (colored) | Details
+//
 // For sections in sectionsWithoutOrganization (and for the predictive
 // report, #240, where org mapping isn't meaningful), the Organization
 // column is dropped — producing a 3-column table: Name | Outcome |
@@ -549,14 +569,14 @@ func renderUnifiedTable(pdf *fpdf.Fpdf, section Section, predictive bool) {
 	// not balloon vertically. Multi-line details (typically metric mapping
 	// notes) also drop to a smaller 6pt font so the per-line cost stays low.
 	const (
-		singleLineH       = 6.0
+		singleLineH = 6.0
 		// wrappedLineH at 3.0mm was too tight for the 8pt body font
 		// used in the Name column: descenders on g/p/y/j were clipped
 		// for long wrapping setting keys (issue #207, example
 		// sonar.java.ignoreUnnamedModuleForSplitPackage). 4.0mm gives
 		// 8pt enough leading while staying readable for the 6pt
 		// multi-line details column.
-		wrappedLineH = 4.0
+		wrappedLineH      = 4.0
 		bodyFontSize      = 8.0
 		multiLineFontSize = 6.0
 	)
@@ -582,7 +602,13 @@ func renderUnifiedTable(pdf *fpdf.Fpdf, section Section, predictive bool) {
 		// the real-migrate and predictive reports.
 		detailsFontSize := multiLineFontSize
 		pdf.SetFont(pdfFontFamilyBody, "", detailsFontSize)
-		detailsLineCount := len(pdf.SplitLines([]byte(detailsText), widths[detailsCol]))
+		// Use the same width-aware wrap that drawDetailsCell uses at
+		// render time, so the row height matches the actual line
+		// count. wrapInlineBoldLines handles plain text and inline-
+		// bold spans uniformly, and crucially hard-breaks tokens
+		// wider than the cell (long SonarCloud project keys, #345).
+		const detailsCellPad = 1.0
+		detailsLineCount := len(wrapInlineBoldLines(pdf, detailsText, widths[detailsCol]-detailsCellPad, detailsFontSize))
 		pdf.SetFont(pdfFontFamilyBody, "", bodyFontSize)
 		if detailsLineCount < 1 {
 			detailsLineCount = 1
@@ -684,18 +710,20 @@ func renderUnifiedTable(pdf *fpdf.Fpdf, section Section, predictive bool) {
 }
 
 // drawDetailsCell renders the Details column for a unified-table row.
-// It supports inline bold markers (inlineBoldStart / inlineBoldEnd) by
-// drawing the cell border + fill manually via pdf.Rect and rendering
-// the text with pdf.Write so the font style can flip mid-line. When
-// the text contains no markers the function delegates to the regular
-// drawWrappedCell, preserving the existing wrap semantics for every
-// section that doesn't need inline bold (i.e. everything except the
-// Projects section's "New Project Key:" label).
+// It always wraps via wrapInlineBoldLines — that path's width-aware
+// wrap (#302) handles both inline-bold spans AND the hard-break-at-
+// runes fallback that long tokens need to stay inside the cell.
+// The previous no-marker shortcut delegated to gofpdf's
+// pdf.SplitLines, which only wraps at whitespace and let long
+// SonarCloud project keys in Failed / Skipped rows overflow into
+// the next row's first column (#345).
+//
+// Width-aware wrap matters because pdf.Write — the only fpdf helper
+// that lets us flip font style mid-line — wraps at the *page* right
+// margin, not the cell's right edge. A long bold value would
+// otherwise overflow and "wrap" by continuing at the page's LEFT
+// margin, splashing into the next row's leftmost column (#302).
 func drawDetailsCell(pdf *fpdf.Fpdf, w, lineH float64, lineCount int, text string, fontSize float64) {
-	if !strings.Contains(text, inlineBoldStart) {
-		drawWrappedCell(pdf, w, lineH, lineCount, pdf.SplitLines([]byte(text), w))
-		return
-	}
 	x, y := pdf.GetXY()
 	rowH := lineH * float64(lineCount)
 	// Fill background + draw outer border in one Rect call. SetFillColor
@@ -704,41 +732,188 @@ func drawDetailsCell(pdf *fpdf.Fpdf, w, lineH float64, lineCount int, text strin
 	pdf.Rect(x, y, w, rowH, "FD")
 
 	const leftPad = 1.0
-	for i, line := range strings.Split(text, "\n") {
+	cellWidth := w - leftPad
+	phys := wrapInlineBoldLines(pdf, text, cellWidth, fontSize)
+	for i, segs := range phys {
 		if i >= lineCount {
 			break
 		}
 		pdf.SetXY(x+leftPad, y+float64(i)*lineH)
-		writeInlineBold(pdf, line, lineH, fontSize)
+		writeInlineBoldLine(pdf, segs, lineH, fontSize)
 	}
 	pdf.SetXY(x+w, y)
 }
 
-// writeInlineBold renders a single line of text with optional inline
-// bold ranges marked by inlineBoldStart / inlineBoldEnd. Anything
-// outside a marker pair is rendered in the regular body font; the
-// marked span flips to bold and back.
-func writeInlineBold(pdf *fpdf.Fpdf, line string, lineH, fontSize float64) {
-	pdf.SetFont(pdfFontFamilyBody, "", fontSize)
+// styledSeg is a contiguous run of characters that all share the
+// same font style (regular or bold). A single physical line of a
+// details cell is a slice of styledSegs in left-to-right order.
+type styledSeg struct {
+	text string
+	bold bool
+}
+
+// splitStyledLine turns a logical line (no embedded newlines) into
+// styled segments by tokenising on inlineBoldStart / inlineBoldEnd.
+// Unclosed markers cause the rest of the line to render as bold so
+// the operator's intent isn't lost on malformed input.
+func splitStyledLine(line string) []styledSeg {
+	var out []styledSeg
 	parts := strings.Split(line, inlineBoldStart)
-	if len(parts) > 0 {
-		pdf.Write(lineH, parts[0])
+	if parts[0] != "" {
+		out = append(out, styledSeg{text: parts[0], bold: false})
 	}
 	for _, p := range parts[1:] {
 		idx := strings.Index(p, inlineBoldEnd)
 		if idx < 0 {
-			// Unclosed marker — treat the rest of the line as bold so
-			// at least the intent ("emphasise the trailing portion")
-			// survives.
-			pdf.SetFont(pdfFontFamilyBody, "B", fontSize)
-			pdf.Write(lineH, p)
-			pdf.SetFont(pdfFontFamilyBody, "", fontSize)
+			out = append(out, styledSeg{text: p, bold: true})
 			continue
 		}
-		pdf.SetFont(pdfFontFamilyBody, "B", fontSize)
-		pdf.Write(lineH, p[:idx])
-		pdf.SetFont(pdfFontFamilyBody, "", fontSize)
-		pdf.Write(lineH, p[idx+len(inlineBoldEnd):])
+		if idx > 0 {
+			out = append(out, styledSeg{text: p[:idx], bold: true})
+		}
+		if rest := p[idx+len(inlineBoldEnd):]; rest != "" {
+			out = append(out, styledSeg{text: rest, bold: false})
+		}
+	}
+	return out
+}
+
+// tokenizeForWrap splits a segment of text into atomic break units.
+// Words are kept together; whitespace and commas act as break points
+// but stay attached to the preceding token so commas don't end up
+// orphaned at the start of a wrapped line (most settings values are
+// long CSVs with no whitespace — commas are the only natural break).
+func tokenizeForWrap(s string) []string {
+	if s == "" {
+		return nil
+	}
+	var out []string
+	var cur strings.Builder
+	for _, r := range s {
+		cur.WriteRune(r)
+		if r == ' ' || r == '\t' || r == ',' {
+			out = append(out, cur.String())
+			cur.Reset()
+		}
+	}
+	if cur.Len() > 0 {
+		out = append(out, cur.String())
+	}
+	return out
+}
+
+// wrapInlineBoldLines wraps each newline-delimited logical line in
+// `text` to fit within `cellWidth` mm, accounting for the different
+// glyph widths of the regular and bold body fonts. Returns one slice
+// of styledSegs per physical line, ready for writeInlineBoldLine to
+// render. Pure measurement; no drawing.
+func wrapInlineBoldLines(pdf *fpdf.Fpdf, text string, cellWidth, fontSize float64) [][]styledSeg {
+	var out [][]styledSeg
+	for _, logical := range strings.Split(text, "\n") {
+		segs := splitStyledLine(logical)
+		out = append(out, wrapOneLogicalLine(pdf, segs, cellWidth, fontSize)...)
+	}
+	return out
+}
+
+// wrapOneLogicalLine performs the greedy word-wrap for a single
+// logical line's worth of styledSegs. Tokens that are wider than
+// cellWidth on their own (rare, but possible for path-like values
+// with no separators) are hard-broken at character boundaries.
+func wrapOneLogicalLine(pdf *fpdf.Fpdf, segs []styledSeg, cellWidth, fontSize float64) [][]styledSeg {
+	setStyle := func(bold bool) {
+		if bold {
+			pdf.SetFont(pdfFontFamilyBody, "B", fontSize)
+		} else {
+			pdf.SetFont(pdfFontFamilyBody, "", fontSize)
+		}
+	}
+
+	var out [][]styledSeg
+	var line []styledSeg
+	var lineW float64
+
+	appendToken := func(tok string, bold, isHardBreak bool) {
+		if !isHardBreak && len(line) > 0 && line[len(line)-1].bold == bold {
+			line[len(line)-1].text += tok
+		} else {
+			line = append(line, styledSeg{text: tok, bold: bold})
+		}
+	}
+	flush := func() {
+		if len(line) > 0 {
+			out = append(out, line)
+			line = nil
+			lineW = 0
+		}
+	}
+
+	for _, seg := range segs {
+		setStyle(seg.bold)
+		for _, tok := range tokenizeForWrap(seg.text) {
+			tw := pdf.GetStringWidth(tok)
+			// Token fits on the current line.
+			if lineW+tw <= cellWidth {
+				appendToken(tok, seg.bold, false)
+				lineW += tw
+				continue
+			}
+			// Token doesn't fit. Try wrapping to a new line first.
+			if lineW > 0 {
+				flush()
+				if tw <= cellWidth {
+					appendToken(tok, seg.bold, false)
+					lineW += tw
+					continue
+				}
+			}
+			// Token alone is wider than the cell — hard-break at runes.
+			for _, r := range tok {
+				rs := string(r)
+				rw := pdf.GetStringWidth(rs)
+				if lineW+rw > cellWidth && lineW > 0 {
+					flush()
+				}
+				appendToken(rs, seg.bold, false)
+				lineW += rw
+			}
+		}
+	}
+	flush()
+	// Empty logical line still occupies one physical line so a stray
+	// "\n\n" in the source doesn't collapse to zero rows.
+	if len(out) == 0 {
+		out = append(out, nil)
+	}
+	return out
+}
+
+// writeInlineBoldLine renders one physical line's styled segments at
+// the cursor's current (x, y). Caller is responsible for positioning
+// the cursor (drawDetailsCell does this per line).
+//
+// Each segment is drawn via pdf.CellFormat with its measured width.
+// Earlier versions used pdf.Write, which wraps at the *page* right
+// margin: on the Details column (the rightmost, whose right edge
+// hugs the page-right margin) a sub-millimetre rounding drift was
+// enough to trip Write's wrap and continue the bold key at the
+// page's *left* margin, splashing into the Name / Organization
+// columns of the same visual row (#345). CellFormat takes an
+// explicit width and never wraps, so the rendered glyphs stay
+// inside the cell even when the line lands flush against the
+// cellWidth that wrapInlineBoldLines measured.
+func writeInlineBoldLine(pdf *fpdf.Fpdf, segs []styledSeg, lineH, fontSize float64) {
+	for _, s := range segs {
+		if s.bold {
+			pdf.SetFont(pdfFontFamilyBody, "B", fontSize)
+		} else {
+			pdf.SetFont(pdfFontFamilyBody, "", fontSize)
+		}
+		if s.text == "" {
+			continue
+		}
+		w := pdf.GetStringWidth(s.text)
+		pdf.CellFormat(w, lineH, s.text, "", 0, "L", false, 0, "")
 	}
 }
 
@@ -966,7 +1141,7 @@ const (
 //   - |ncdFallback:<sqs_type> — issue #135, the SQS NCD type wasn't
 //     supported at SonarCloud project scope; the project fell back
 //     to the org default.
-//   - |scan:<status> — issue #208 era, scan-history import outcome.
+//   - |scan:<status> — issue #208 era, project-data import outcome.
 //
 // Both markers are split off and rendered on separate lines after
 // the cloud key. When predictive is true (#240) the SYNTHETIC
@@ -998,7 +1173,7 @@ func successDetails(item EntityItem, predictive, hideCloudKey, labelProjectKey b
 			ncdFallback))
 	}
 	if scan != "" {
-		parts = append(parts, fmt.Sprintf("scan history: %s", scanStatusLabel(scan)))
+		parts = append(parts, fmt.Sprintf("project data: %s", scanStatusLabel(scan)))
 	}
 	return strings.Join(parts, "\n")
 }
@@ -1014,21 +1189,25 @@ func successDetails(item EntityItem, predictive, hideCloudKey, labelProjectKey b
 // project cloud key is rendered as "New Project Key: <key>" with the
 // key bold.
 func partialDetails(item EntityItem, predictive, hideCloudKey, labelProjectKey bool) string {
+	// Reuse successDetails for the cloud-key / NCD-fallback / project-data
+	// header so the |scan: and |ncdFallback: markers are split off and
+	// rendered on their own lines (exactly like Succeeded rows), instead
+	// of leaving the raw marker embedded inside the bolded project key.
+	// Embedding the raw marker previously left the inline-bold span
+	// unterminated when a downstream renderer re-split on "|scan:" (the
+	// Markdown report truncated the closing bold marker and the issue
+	// lines). Then append the per-item issue lines that make the row
+	// Partial / NearPerfect.
+	head := successDetails(item, predictive, hideCloudKey, labelProjectKey)
 	issues := strings.Join(item.Issues, "\n")
-	detail := item.Detail
-	if hideCloudKey || (predictive && strings.HasPrefix(detail, "predict:")) {
-		detail = ""
-	}
-	if labelProjectKey && detail != "" {
-		detail = "New Project Key: " + inlineBoldStart + detail + inlineBoldEnd
-	}
-	if detail != "" && issues != "" {
-		return detail + "\n" + issues
-	}
-	if issues != "" {
+	switch {
+	case head != "" && issues != "":
+		return head + "\n" + issues
+	case issues != "":
 		return issues
+	default:
+		return head
 	}
-	return detail
 }
 
 // skippedDetails formats the Details column for a Skipped item — prefer the
@@ -1111,7 +1290,7 @@ func renderTableHeader(pdf *fpdf.Fpdf, headers []string, widths []float64) {
 	pdf.Ln(-1)
 }
 
-func parseScanHistory(detail string) (string, string) {
+func parseProjectData(detail string) (string, string) {
 	idx := strings.Index(detail, "|scan:")
 	if idx < 0 {
 		return detail, ""
@@ -1120,7 +1299,7 @@ func parseScanHistory(detail string) (string, string) {
 }
 
 // parseProjectDetailMarkers splits a project's Detail string into its
-// three parts: the cloud key, the scan-history status (or empty),
+// three parts: the cloud key, the project-data status (or empty),
 // and the NCD fallback source type (or empty). Marker ordering set
 // by attachNCDFallback puts the NCD marker BEFORE the scan marker.
 func parseProjectDetailMarkers(detail string) (cloudKey, scan, ncdFallback string) {
@@ -1217,4 +1396,398 @@ func itoa(n int) string {
 func lowerLabelPreservingProductName(s string) string {
 	out := strings.ToLower(s)
 	return strings.ReplaceAll(out, "sonarqube", "SonarQube")
+}
+
+// ---------------------------------------------------------------------------
+// Runtime telemetry renderers (#240+).
+//
+// Everything below renders the migrate engine's per-run telemetry that is
+// collected from the run directory (run_meta.json / run_events.jsonl) into
+// the in-memory MigrationSummary. All of these renderers are NO-OPs when
+// their backing slice is empty / the start time is zero, so predictive
+// reports — which never populate the runtime fields — produce no extra
+// pages. They reuse the existing colour / font constants and table header
+// helper; no new fonts, images, or colours are introduced.
+// ---------------------------------------------------------------------------
+
+// renderSectionHeading draws a section heading using the same heading
+// idiom as renderLimitations / renderSection (Poppins Bold, Sonar primary)
+// with the surrounding spacing + page-break guard, so every runtime
+// section is visually consistent with the rest of the report.
+func renderSectionHeading(pdf *fpdf.Fpdf, title string) {
+	pdf.Ln(8)
+	checkPageBreak(pdf, 30)
+	setColor(pdf, colorSonarBlue)
+	pdf.SetFont(pdfFontFamilyHeading, "B", 14)
+	pdf.CellFormat(0, 10, sanitizeForPDF(title), "", 1, "L", false, 0, "")
+	setColor(pdf, colorBlack)
+}
+
+// renderSubHeading draws a smaller heading used to title an individual
+// table inside a multi-table runtime section (e.g. the per-table titles
+// in renderBottlenecks / renderWarningsLedger).
+func renderSubHeading(pdf *fpdf.Fpdf, title string) {
+	pdf.Ln(3)
+	checkPageBreak(pdf, 20)
+	setColor(pdf, colorSonarBlue)
+	pdf.SetFont(pdfFontFamilyHeading, "B", 11)
+	pdf.CellFormat(0, 8, sanitizeForPDF(title), "", 1, "L", false, 0, "")
+	setColor(pdf, colorBlack)
+}
+
+// formatDuration renders a time.Duration human-readably (e.g. "1m2s",
+// "350ms"). Sub-second durations keep their native String() form;
+// second-or-longer durations are truncated to whole seconds so the
+// table column stays compact ("1m2.34s" → "1m2s").
+func formatDuration(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	if d < time.Second {
+		return d.String()
+	}
+	return d.Truncate(time.Second).String()
+}
+
+// kvCellPad is the internal left padding subtracted from a wrapping
+// column's width before SplitLines / drawWrappedCell measure + draw it,
+// mirroring the detailsCellPad used by renderUnifiedTable.
+const kvCellPad = 1.0
+
+const (
+	// kvLineH / kvFontSize are the per-line height and font size used by
+	// every runtime KV table row.
+	kvLineH    = 5.0
+	kvFontSize = 8.0
+	// kvWrapWidthThreshold: columns wider than this word-wrap via
+	// drawWrappedCell; narrower columns render with a single CellFormat
+	// at the full row height. This keeps long values (endpoints, error
+	// notes, task ids, skip reasons) inside their cell.
+	kvWrapWidthThreshold = 34.0
+)
+
+// kvCell returns the sanitized text for column c of a row, or "" when the
+// row is shorter than the header set.
+func kvCell(row []string, c int) string {
+	if c < len(row) {
+		return sanitizeForPDF(row[c])
+	}
+	return ""
+}
+
+// kvMeasureRow word-wraps every wide column of a row and returns the
+// per-column wrapped lines plus the tallest line count (≥1). The caller
+// must have already selected the kv body font.
+func kvMeasureRow(pdf *fpdf.Fpdf, row []string, widths []float64, headers []string) (wrapped [][][]byte, lineCount int) {
+	lineCount = 1
+	wrapped = make([][][]byte, len(headers))
+	for c := range headers {
+		if c >= len(widths) || widths[c] <= kvWrapWidthThreshold {
+			continue
+		}
+		lines := pdf.SplitLines([]byte(kvCell(row, c)), widths[c]-kvCellPad)
+		if len(lines) < 1 {
+			lines = [][]byte{[]byte(kvCell(row, c))}
+		}
+		wrapped[c] = lines
+		if len(lines) > lineCount {
+			lineCount = len(lines)
+		}
+	}
+	return wrapped, lineCount
+}
+
+// kvDrawRow draws a single measured row at the cursor's current position
+// and leaves the cursor at the start of the next row.
+func kvDrawRow(pdf *fpdf.Fpdf, row []string, widths []float64, headers []string, wrapped [][][]byte, lineCount int) {
+	rowHeight := float64(lineCount) * kvLineH
+	rowStartX := pdf.GetX()
+	rowStartY := pdf.GetY()
+	x := rowStartX
+	for c := range headers {
+		w := 0.0
+		if c < len(widths) {
+			w = widths[c]
+		}
+		pdf.SetXY(x, rowStartY)
+		if c < len(widths) && widths[c] > kvWrapWidthThreshold {
+			// Wide column — wrap the text across the row's height.
+			drawWrappedCell(pdf, w, kvLineH, lineCount, wrapped[c])
+		} else {
+			pdf.CellFormat(w, rowHeight, kvCell(row, c), "1", 0, "L", true, 0, "")
+		}
+		x += w
+	}
+	// Advance to the next row regardless of which column drew last
+	// (drawWrappedCell leaves the cursor flush-right at the row top).
+	pdf.SetXY(rowStartX, rowStartY+rowHeight)
+}
+
+// renderKVTable draws a heading, the shared column header (via the
+// existing renderTableHeader), and one row per entry in `rows`. Columns
+// whose width is "wide" wrap their text with drawWrappedCell; short
+// columns render with a single CellFormat. The row height is the tallest
+// wrapped column.
+//
+// Unlike renderUnifiedTable, this helper repeats the column header on
+// every continuation page: before drawing each row, if the row would
+// cross the page's bottom margin, it calls pdf.AddPage() and re-draws the
+// header via renderTableHeader. This keeps the long runtime tables
+// readable across page breaks.
+//
+// No-op when there are no rows so an empty sub-table renders nothing.
+func renderKVTable(pdf *fpdf.Fpdf, title string, headers []string, widths []float64, rows [][]string) {
+	if len(rows) == 0 {
+		return
+	}
+	if title != "" {
+		renderSubHeading(pdf, title)
+	}
+	renderTableHeader(pdf, headers, widths)
+
+	_, pageH := pdf.GetPageSize()
+	_, _, _, bottom := pdf.GetMargins()
+	pageBottom := pageH - bottom
+
+	for i, row := range rows {
+		pdf.SetFont(pdfFontFamilyBody, "", kvFontSize)
+		wrapped, lineCount := kvMeasureRow(pdf, row, widths, headers)
+		rowHeight := float64(lineCount) * kvLineH
+
+		// Repeat the header on continuation pages. The existing
+		// renderUnifiedTable relies on checkPageBreak only; these long
+		// tables additionally re-draw their header so every page is
+		// self-describing.
+		if pdf.GetY()+rowHeight > pageBottom {
+			pdf.AddPage()
+			renderTableHeader(pdf, headers, widths)
+		}
+
+		if i%2 == 0 {
+			setFillColor(pdf, colorLightGray)
+		} else {
+			setFillColor(pdf, colorWhite)
+		}
+		setColor(pdf, colorBlack)
+		pdf.SetFont(pdfFontFamilyBody, "", kvFontSize)
+		kvDrawRow(pdf, row, widths, headers, wrapped, lineCount)
+	}
+}
+
+// renderRunMetadata renders the "Run metadata" section: a small key/value
+// block with the run's Started / Completed timestamps, total elapsed wall
+// time, and overall status. The Run ID already appears on the title page,
+// so it is intentionally omitted here. No-op for predictive reports,
+// where StartedAt is the zero time.
+func renderRunMetadata(pdf *fpdf.Fpdf, summary *MigrationSummary) {
+	if summary.StartedAt.IsZero() {
+		return
+	}
+	renderSectionHeading(pdf, "Run metadata")
+
+	rows := [][]string{
+		{"Started", summary.StartedAt.Format("2006-01-02 15:04:05")},
+		{"Completed", summary.CompletedAt.Format("2006-01-02 15:04:05")},
+		{"Total elapsed", formatDuration(summary.TotalElapsed)},
+		{"Overall status", summary.OverallStatus},
+	}
+	// No per-table sub-heading (the section heading already names it);
+	// pass an empty title so renderKVTable only draws the column header.
+	renderKVTable(pdf, "", []string{"Field", "Value"}, []float64{50, 130}, rows)
+}
+
+// renderBottlenecks renders the "Performance bottlenecks" section as three
+// key/value tables: phase timings, the slowest tasks, and per-branch CE
+// activity. No-op when Phases, Tasks and Branches are all empty.
+func renderBottlenecks(pdf *fpdf.Fpdf, summary *MigrationSummary) {
+	if len(summary.Phases) == 0 && len(summary.Tasks) == 0 && len(summary.Branches) == 0 {
+		return
+	}
+	renderSectionHeading(pdf, "Performance bottlenecks")
+
+	// Phase timings.
+	phaseRows := make([][]string, 0, len(summary.Phases))
+	for _, p := range summary.Phases {
+		phaseRows = append(phaseRows, []string{
+			p.Phase,
+			itoa(p.Tasks),
+			formatDuration(p.Duration),
+		})
+	}
+	renderKVTable(pdf, "Phase timings",
+		[]string{"Phase", "Tasks", "Duration"},
+		[]float64{110, 30, 40},
+		phaseRows)
+
+	// Slowest tasks — sort a copy descending by duration so the heaviest
+	// tasks lead the table.
+	slowest := make([]TaskTiming, len(summary.Tasks))
+	copy(slowest, summary.Tasks)
+	sort.SliceStable(slowest, func(i, j int) bool {
+		return slowest[i].Duration > slowest[j].Duration
+	})
+	taskRows := make([][]string, 0, len(slowest))
+	for _, t := range slowest {
+		ok := "Yes"
+		if !t.OK {
+			ok = "No"
+		}
+		taskRows = append(taskRows, []string{
+			t.Task,
+			itoa(t.Phase),
+			formatDuration(t.Duration),
+			ok,
+		})
+	}
+	renderKVTable(pdf, "Slowest tasks",
+		[]string{"Task", "Phase", "Duration", "OK"},
+		[]float64{105, 25, 30, 20},
+		taskRows)
+
+	// Per-branch CE activity.
+	branchRows := make([][]string, 0, len(summary.Branches))
+	for _, b := range summary.Branches {
+		branchRows = append(branchRows, []string{
+			b.Branch,
+			b.Type,
+			b.Status,
+			b.TaskID,
+		})
+	}
+	renderKVTable(pdf, "Per-branch CE activity",
+		[]string{"Branch", "Type", "Status", "Task Id"},
+		[]float64{55, 25, 30, 70},
+		branchRows)
+}
+
+// renderFailureLedger renders the "Failure ledger" section: one table of
+// entity-level failures. The Error column is the only wide column and
+// wraps. No-op when there are no failures.
+func renderFailureLedger(pdf *fpdf.Fpdf, summary *MigrationSummary) {
+	if len(summary.Failures) == 0 {
+		return
+	}
+	renderSectionHeading(pdf, "Failure ledger")
+
+	rows := make([][]string, 0, len(summary.Failures))
+	for _, f := range summary.Failures {
+		rows = append(rows, []string{
+			f.EntityType,
+			f.EntityName,
+			f.Organization,
+			f.HTTPStatus,
+			f.ErrorMessage,
+		})
+	}
+	renderKVTable(pdf, "",
+		[]string{"Entity Type", "Name", "Organization", "HTTP", "Error"},
+		[]float64{30, 40, 30, 18, 62},
+		rows)
+}
+
+// renderWarningsLedger renders the "Warnings ledger" section as up to
+// four key/value sub-tables: HTTP retries, branch skips, gate condition
+// skips/remaps, and metric remaps. Each sub-table no-ops when its slice
+// is empty (renderKVTable returns early on zero rows), and the whole
+// section no-ops when every slice is empty.
+func renderWarningsLedger(pdf *fpdf.Fpdf, summary *MigrationSummary) {
+	w := summary.Warnings
+	if len(w.Retries) == 0 && len(w.BranchSkips) == 0 &&
+		len(w.GateConditions) == 0 && len(w.MetricRemaps) == 0 {
+		return
+	}
+	renderSectionHeading(pdf, "Warnings ledger")
+
+	// Retries.
+	retryRows := make([][]string, 0, len(w.Retries))
+	for _, r := range w.Retries {
+		retryRows = append(retryRows, []string{
+			r.Method,
+			r.Endpoint,
+			itoa(r.Count),
+			itoa(r.MaxAttempt),
+			r.LastStatus,
+		})
+	}
+	renderKVTable(pdf, "Retries",
+		[]string{"Method", "Endpoint", "Retries", "Max Attempt", "Last Status"},
+		[]float64{20, 70, 20, 28, 24},
+		retryRows)
+
+	// Branch skips.
+	skipRows := make([][]string, 0, len(w.BranchSkips))
+	for _, b := range w.BranchSkips {
+		skipRows = append(skipRows, []string{
+			b.Branch,
+			itoa(b.Findings),
+			b.Reason,
+		})
+	}
+	renderKVTable(pdf, "Branch Skips",
+		[]string{"Branch", "Findings", "Reason"},
+		[]float64{50, 25, 95},
+		skipRows)
+
+	// Gate condition skips / remaps.
+	gateRows := make([][]string, 0, len(w.GateConditions))
+	for _, g := range w.GateConditions {
+		gateRows = append(gateRows, []string{
+			g.Gate,
+			g.Metric,
+			g.Action,
+			g.Note,
+		})
+	}
+	renderKVTable(pdf, "Gate Condition Skips",
+		[]string{"Gate", "Metric", "Action", "Note"},
+		[]float64{40, 40, 25, 65},
+		gateRows)
+
+	// Metric remaps.
+	remapRows := make([][]string, 0, len(w.MetricRemaps))
+	for _, m := range w.MetricRemaps {
+		remapRows = append(remapRows, []string{
+			m.Gate,
+			m.SourceMetric,
+			m.TargetMetric,
+		})
+	}
+	renderKVTable(pdf, "Metric Remaps",
+		[]string{"Gate", "Source Metric", "Target Metric"},
+		[]float64{50, 60, 60},
+		remapRows)
+}
+
+// renderBranchProjectData renders the "Branch project data" section: one
+// table summarising every branch's packaging / submission stats. The Skip
+// Reason column is the only wide column and wraps. No-op when there are no
+// branches.
+func renderBranchProjectData(pdf *fpdf.Fpdf, summary *MigrationSummary) {
+	if len(summary.Branches) == 0 {
+		return
+	}
+	renderSectionHeading(pdf, "Branch project data")
+
+	rows := make([][]string, 0, len(summary.Branches))
+	for _, b := range summary.Branches {
+		zipBytes := ""
+		if b.ZipBytes > 0 {
+			zipBytes = fmt.Sprintf("%d", b.ZipBytes)
+		}
+		rows = append(rows, []string{
+			b.Branch,
+			b.Type,
+			b.Status,
+			itoa(b.Issues),
+			itoa(b.ExternalIssues),
+			itoa(b.Components),
+			itoa(b.ActiveRules),
+			zipBytes,
+			b.SkipReason,
+		})
+	}
+	renderKVTable(pdf, "",
+		[]string{"Branch", "Type", "Status", "Issues", "External", "Components", "Active Rules", "Zip Bytes", "Skip Reason"},
+		[]float64{28, 16, 18, 14, 16, 22, 20, 18, 28},
+		rows)
 }

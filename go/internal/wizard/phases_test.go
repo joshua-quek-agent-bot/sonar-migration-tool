@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package wizard
 
 import (
@@ -427,7 +431,7 @@ func TestRunFullWizardMocked(t *testing.T) {
 			true, // cloud credentials review
 		},
 		ConfirmResponses: []bool{
-			false, // include scan history
+			false, // include project data
 			true,  // migrate org-1
 			true,  // proceed with migration
 		},

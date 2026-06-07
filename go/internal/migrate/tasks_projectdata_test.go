@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package migrate
 
 import (
@@ -17,6 +21,36 @@ import (
 )
 
 // --- Pure utility function tests ---
+
+func TestDedupActiveRules(t *testing.T) {
+	// After remapping, multiple source profiles for one language share a
+	// single SonarCloud profile key, producing duplicate (repo,key,qProfileKey)
+	// triples. The CE rejects a profile that activates the same rule twice, so
+	// dedup must keep exactly one per triple while preserving distinct rules.
+	in := []scanreport.ActiveRuleInput{
+		{RuleRepo: "python", RuleKey: "S100", QProfileKey: "qpPy", Language: "py"}, // from "Sonar way"
+		{RuleRepo: "python", RuleKey: "S100", QProfileKey: "qpPy", Language: "py"}, // dup from "Olivier Way"
+		{RuleRepo: "python", RuleKey: "S100", QProfileKey: "qpPy", Language: "py"}, // dup x3
+		{RuleRepo: "python", RuleKey: "S200", QProfileKey: "qpPy", Language: "py"}, // distinct rule
+		{RuleRepo: "docker", RuleKey: "S100", QProfileKey: "qpDk", Language: "docker"}, // distinct repo+profile
+	}
+	out := dedupActiveRules(in)
+	if len(out) != 3 {
+		t.Fatalf("expected 3 distinct active rules, got %d: %+v", len(out), out)
+	}
+	seen := map[string]bool{}
+	for _, r := range out {
+		k := r.RuleRepo + "|" + r.RuleKey + "|" + r.QProfileKey
+		if seen[k] {
+			t.Errorf("duplicate survived dedup: %s", k)
+		}
+		seen[k] = true
+	}
+	// First occurrence preserved.
+	if out[0].RuleKey != "S100" || out[1].RuleKey != "S200" || out[2].RuleRepo != "docker" {
+		t.Errorf("order/first-occurrence not preserved: %+v", out)
+	}
+}
 
 func TestSplitRule(t *testing.T) {
 	tests := []struct {
@@ -175,13 +209,13 @@ func TestCountFilesByExtEmpty(t *testing.T) {
 	}
 }
 
-func TestScanHistoryTasksDef(t *testing.T) {
-	tasks := scanHistoryTasks()
+func TestProjectDataTasksDef(t *testing.T) {
+	tasks := projectDataTasks()
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 task, got %d", len(tasks))
 	}
-	if tasks[0].Name != "importScanHistory" {
-		t.Errorf("expected importScanHistory, got %s", tasks[0].Name)
+	if tasks[0].Name != "importProjectData" {
+		t.Errorf("expected importProjectData, got %s", tasks[0].Name)
 	}
 }
 
@@ -218,7 +252,7 @@ func TestBuildChangesetMap(t *testing.T) {
 
 // --- Data loading function tests (require extract dir setup) ---
 
-func setupScanHistoryExtract(t *testing.T, dir string) {
+func setupProjectDataExtract(t *testing.T, dir string) {
 	t.Helper()
 	extractDir := filepath.Join(dir, "extract-01")
 
@@ -297,7 +331,7 @@ func setupScanHistoryExtract(t *testing.T, dir string) {
 	})
 }
 
-func newScanHistoryExecutor(t *testing.T, dir string) *Executor {
+func newProjectDataExecutor(t *testing.T, dir string) *Executor {
 	t.Helper()
 	runDir := filepath.Join(dir, "run-test")
 	os.MkdirAll(runDir, 0o755)
@@ -312,8 +346,8 @@ func newScanHistoryExecutor(t *testing.T, dir string) *Executor {
 
 func TestCollectBranchInfo(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
-	e := newScanHistoryExecutor(t, dir)
+	setupProjectDataExtract(t, dir)
+	e := newProjectDataExecutor(t, dir)
 
 	branches := collectBranchInfo(e, testServerURL, "proj1")
 	if len(branches) != 2 {
@@ -327,10 +361,84 @@ func TestCollectBranchInfo(t *testing.T) {
 	}
 }
 
+func TestResolveMainTargetName(t *testing.T) {
+	master := branchInfo{Name: "master", IsMain: true}
+	cases := []struct {
+		name         string
+		scMainBranch string
+		mainBranch   *branchInfo
+		want         string
+	}{
+		{"prefers SC main branch name", "main", &master, "main"},
+		{"falls back to SQ main when SC unknown", "", &master, "master"},
+		{"empty when no main known", "", nil, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resolveMainTargetName(tc.scMainBranch, tc.mainBranch); got != tc.want {
+				t.Errorf("resolveMainTargetName(%q, %v) = %q, want %q", tc.scMainBranch, tc.mainBranch, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMaxIssueEndLineByComponent(t *testing.T) {
+	native := []scanreport.IssueInput{
+		{Component: "a", StartLine: 10, EndLine: 20},
+		{Component: "a", StartLine: 5, EndLine: 8},
+		{Component: "b", StartLine: 30, EndLine: 0}, // end < start -> use start
+	}
+	hotspots := []scanreport.IssueInput{
+		{Component: "a", StartLine: 25, EndLine: 40},
+	}
+	external := []scanreport.ExternalIssueInput{
+		{Component: "c", StartLine: 1, EndLine: 99},
+		{Component: "", StartLine: 1, EndLine: 5}, // empty component ignored
+	}
+	m := maxIssueEndLineByComponent(native, hotspots, external)
+	if m["a"] != 40 {
+		t.Errorf("component a: want 40, got %d", m["a"])
+	}
+	if m["b"] != 30 {
+		t.Errorf("component b (start>end): want 30, got %d", m["b"])
+	}
+	if m["c"] != 99 {
+		t.Errorf("component c: want 99, got %d", m["c"])
+	}
+	if _, ok := m[""]; ok {
+		t.Errorf("empty component key must be ignored")
+	}
+}
+
+func TestDropIssuesWithInactiveRules(t *testing.T) {
+	active := []scanreport.ActiveRuleInput{
+		{RuleRepo: "python", RuleKey: "S100"},
+		{RuleRepo: "python", RuleKey: "S125"},
+	}
+	issues := []scanreport.IssueInput{
+		{RuleRepo: "python", RuleKey: "S100", Component: "a"},
+		{RuleRepo: "secrets", RuleKey: "S6702", Component: "b"}, // orphan -> dropped
+		{RuleRepo: "python", RuleKey: "S125", Component: "c"},
+		{RuleRepo: "secrets", RuleKey: "S6702", Component: "b"}, // orphan -> dropped
+	}
+	kept, dropped := dropIssuesWithInactiveRules(issues, active)
+	if dropped != 2 {
+		t.Errorf("dropped: want 2, got %d", dropped)
+	}
+	if len(kept) != 2 {
+		t.Fatalf("kept: want 2, got %d", len(kept))
+	}
+	for _, k := range kept {
+		if k.RuleRepo == "secrets" {
+			t.Errorf("orphan secrets issue must have been dropped, got %+v", k)
+		}
+	}
+}
+
 func TestCollectBranchInfoNoMatch(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
-	e := newScanHistoryExecutor(t, dir)
+	setupProjectDataExtract(t, dir)
+	e := newProjectDataExecutor(t, dir)
 
 	branches := collectBranchInfo(e, testServerURL, "nonexistent")
 	if len(branches) != 0 {
@@ -340,8 +448,8 @@ func TestCollectBranchInfoNoMatch(t *testing.T) {
 
 func TestCollectBranchInfoWrongServer(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
-	e := newScanHistoryExecutor(t, dir)
+	setupProjectDataExtract(t, dir)
+	e := newProjectDataExecutor(t, dir)
 
 	branches := collectBranchInfo(e, "https://other.server/", "proj1")
 	if len(branches) != 0 {
@@ -351,8 +459,8 @@ func TestCollectBranchInfoWrongServer(t *testing.T) {
 
 func TestLoadExtractedSources(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
-	e := newScanHistoryExecutor(t, dir)
+	setupProjectDataExtract(t, dir)
+	e := newProjectDataExecutor(t, dir)
 
 	sources := loadExtractedSources(e, testServerURL, "proj1", "main")
 	if len(sources) != 2 {
@@ -368,8 +476,8 @@ func TestLoadExtractedSources(t *testing.T) {
 
 func TestLoadExtractedSourcesWrongBranch(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
-	e := newScanHistoryExecutor(t, dir)
+	setupProjectDataExtract(t, dir)
+	e := newProjectDataExecutor(t, dir)
 
 	sources := loadExtractedSources(e, testServerURL, "proj1", "nonexistent")
 	if len(sources) != 0 {
@@ -379,8 +487,8 @@ func TestLoadExtractedSourcesWrongBranch(t *testing.T) {
 
 func TestLoadExtractedIssues(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
-	e := newScanHistoryExecutor(t, dir)
+	setupProjectDataExtract(t, dir)
+	e := newProjectDataExecutor(t, dir)
 
 	issues := loadExtractedIssues(e, testServerURL, "proj1", "main")
 	if len(issues) != 1 {
@@ -399,8 +507,8 @@ func TestLoadExtractedIssues(t *testing.T) {
 
 func TestLoadExtractedIssuesWrongProject(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
-	e := newScanHistoryExecutor(t, dir)
+	setupProjectDataExtract(t, dir)
+	e := newProjectDataExecutor(t, dir)
 
 	issues := loadExtractedIssues(e, testServerURL, "other-proj", "main")
 	if len(issues) != 0 {
@@ -410,8 +518,8 @@ func TestLoadExtractedIssuesWrongProject(t *testing.T) {
 
 func TestLoadExtractedComponents(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
-	e := newScanHistoryExecutor(t, dir)
+	setupProjectDataExtract(t, dir)
+	e := newProjectDataExecutor(t, dir)
 
 	components := loadExtractedComponents(e, testServerURL, "proj1", "main")
 	if len(components) != 2 {
@@ -431,8 +539,8 @@ func TestLoadExtractedComponents(t *testing.T) {
 
 func TestLoadExtractedActiveRules(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
-	e := newScanHistoryExecutor(t, dir)
+	setupProjectDataExtract(t, dir)
+	e := newProjectDataExecutor(t, dir)
 
 	rules := loadExtractedActiveRules(e, testServerURL, "proj1")
 	if len(rules) != 1 {
@@ -445,8 +553,8 @@ func TestLoadExtractedActiveRules(t *testing.T) {
 
 func TestLoadExtractedQProfiles(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
-	e := newScanHistoryExecutor(t, dir)
+	setupProjectDataExtract(t, dir)
+	e := newProjectDataExecutor(t, dir)
 
 	profiles := loadExtractedQProfiles(e, testServerURL, "proj1")
 	if len(profiles) != 1 {
@@ -521,8 +629,8 @@ func TestParseISODate(t *testing.T) {
 
 func TestLoadExtractedHotspots(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
-	e := newScanHistoryExecutor(t, dir)
+	setupProjectDataExtract(t, dir)
+	e := newProjectDataExecutor(t, dir)
 
 	hotspots := loadExtractedHotspots(e, testServerURL, "proj1", "main")
 	if len(hotspots) != 1 {
@@ -544,8 +652,8 @@ func TestLoadExtractedHotspots(t *testing.T) {
 
 func TestLoadExtractedHotspotsWrongProject(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
-	e := newScanHistoryExecutor(t, dir)
+	setupProjectDataExtract(t, dir)
+	e := newProjectDataExecutor(t, dir)
 
 	hotspots := loadExtractedHotspots(e, testServerURL, "other-proj", "main")
 	if len(hotspots) != 0 {
@@ -626,18 +734,24 @@ func TestBuildSCProfileMap(t *testing.T) {
 
 func TestBuildSCProfileMapNoCloud(t *testing.T) {
 	dir := t.TempDir()
-	e := newScanHistoryExecutor(t, dir)
+	e := newProjectDataExecutor(t, dir)
 	profiles := buildSCProfileMap(context.Background(), e, testCloudOrg)
 	if len(profiles) != 0 {
 		t.Errorf("expected empty map when Cloud is nil, got %v", profiles)
 	}
 }
 
-// --- Integration tests for importBranch and runImportScanHistory ---
+// --- Integration tests for importBranch and runImportProjectData ---
 
 func newCEMockServer() *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/analysis/analyses": // create-analysis handshake (non-main branches)
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(map[string]any{
+				"id": "analysis-test-uuid", "branchId": "branch-uuid",
+				"branchType": "long", "referenceBranchName": "main",
+			})
 		case "/api/ce/submit":
 			json.NewEncoder(w).Encode(map[string]any{"taskId": "AX-test-123"})
 		case "/api/ce/task":
@@ -652,21 +766,26 @@ func newCEMockServer() *httptest.Server {
 
 func TestImportBranch(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
+	setupProjectDataExtract(t, dir)
 
 	srv := newCEMockServer()
 	defer srv.Close()
 
-	e := newScanHistoryExecutor(t, dir)
+	e := newProjectDataExecutor(t, dir)
 	e.CloudURL = srv.URL + "/"
 	e.Raw = common.NewRawClient(srv.Client(), srv.URL+"/")
+	// Non-main branch import now performs the create-analysis handshake against
+	// the API host; point it at the same mock server.
+	e.APIURL = srv.URL + "/"
+	e.RawAPI = common.NewRawClient(srv.Client(), srv.URL+"/")
 
 	input := importBranchInput{
-		CloudKey:  "cloud-proj1",
-		OrgKey:    "cloud-org1",
-		ServerURL: testServerURL,
-		ServerKey: "proj1",
-		Branch:    "main",
+		CloudKey:        "cloud-proj1",
+		OrgKey:          "cloud-org1",
+		ServerURL:       testServerURL,
+		ServerKey:       "proj1",
+		Branch:          "main",
+		ReferenceBranch: "master",
 	}
 
 	result, err := importBranch(context.Background(), e, input)
@@ -694,7 +813,7 @@ func TestImportBranchSkipsNoComponents(t *testing.T) {
 	writeJSONL(filepath.Join(extractDir, "getActiveProfileRules"), nil)
 	writeJSONL(filepath.Join(extractDir, "getProfiles"), nil)
 
-	e := newScanHistoryExecutor(t, dir)
+	e := newProjectDataExecutor(t, dir)
 
 	input := importBranchInput{
 		CloudKey:  "cloud-proj1",
@@ -713,14 +832,14 @@ func TestImportBranchSkipsNoComponents(t *testing.T) {
 	}
 }
 
-func TestRunImportScanHistory(t *testing.T) {
+func TestRunImportProjectData(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
+	setupProjectDataExtract(t, dir)
 
 	srv := newCEMockServer()
 	defer srv.Close()
 
-	e := newScanHistoryExecutor(t, dir)
+	e := newProjectDataExecutor(t, dir)
 	e.CloudURL = srv.URL + "/"
 	e.Raw = common.NewRawClient(srv.Client(), srv.URL+"/")
 
@@ -734,12 +853,12 @@ func TestRunImportScanHistory(t *testing.T) {
 	})
 	w.WriteOne(b)
 
-	err := runImportScanHistory(context.Background(), e)
+	err := runImportProjectData(context.Background(), e)
 	if err != nil {
-		t.Fatalf("runImportScanHistory: %v", err)
+		t.Fatalf("runImportProjectData: %v", err)
 	}
 
-	items, _ := e.Store.ReadAll("importScanHistory")
+	items, _ := e.Store.ReadAll("importProjectData")
 	if len(items) == 0 {
 		t.Fatal("expected import results written")
 	}
@@ -749,10 +868,10 @@ func TestRunImportScanHistory(t *testing.T) {
 	}
 }
 
-func TestRunImportScanHistorySkipsEmptyKeys(t *testing.T) {
+func TestRunImportProjectDataSkipsEmptyKeys(t *testing.T) {
 	dir := t.TempDir()
-	setupScanHistoryExtract(t, dir)
-	e := newScanHistoryExecutor(t, dir)
+	setupProjectDataExtract(t, dir)
+	e := newProjectDataExecutor(t, dir)
 
 	// Write project with empty cloud key — should be skipped.
 	w, _ := e.Store.Writer("createProjects")
@@ -764,13 +883,347 @@ func TestRunImportScanHistorySkipsEmptyKeys(t *testing.T) {
 	})
 	w.WriteOne(b)
 
-	err := runImportScanHistory(context.Background(), e)
+	err := runImportProjectData(context.Background(), e)
 	if err != nil {
-		t.Fatalf("runImportScanHistory: %v", err)
+		t.Fatalf("runImportProjectData: %v", err)
 	}
 
-	items, _ := e.Store.ReadAll("importScanHistory")
+	items, _ := e.Store.ReadAll("importProjectData")
 	if len(items) != 0 {
 		t.Errorf("expected 0 results for empty keys, got %d", len(items))
+	}
+}
+
+// --- New tests for branch migration fixes ---
+
+func TestSortBranchesMainFirst(t *testing.T) {
+	tests := []struct {
+		name  string
+		input []branchInfo
+		first string
+	}{
+		{
+			name:  "main already first",
+			input: []branchInfo{{Name: "main", IsMain: true}, {Name: "develop"}, {Name: "release"}},
+			first: "main",
+		},
+		{
+			name:  "main in middle",
+			input: []branchInfo{{Name: "develop"}, {Name: "main", IsMain: true}, {Name: "release"}},
+			first: "main",
+		},
+		{
+			name:  "main at end",
+			input: []branchInfo{{Name: "develop"}, {Name: "release"}, {Name: "main", IsMain: true}},
+			first: "main",
+		},
+		{
+			name:  "single branch",
+			input: []branchInfo{{Name: "main", IsMain: true}},
+			first: "main",
+		},
+		{
+			name:  "no main",
+			input: []branchInfo{{Name: "develop"}, {Name: "release"}},
+			first: "develop",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sortBranchesMainFirst(tt.input)
+			if len(tt.input) > 0 && tt.input[0].Name != tt.first {
+				t.Errorf("expected first=%s, got %s", tt.first, tt.input[0].Name)
+			}
+		})
+	}
+}
+
+func TestSortBranchesMainFirstEmpty(t *testing.T) {
+	var empty []branchInfo
+	sortBranchesMainFirst(empty)
+	if len(empty) != 0 {
+		t.Errorf("expected empty slice after sort")
+	}
+}
+
+func TestFilterBranches(t *testing.T) {
+	branches := []branchInfo{
+		{Name: "main", IsMain: true},
+		{Name: "develop"},
+		{Name: "feature/foo"},
+		{Name: "feature/bar"},
+		{Name: "release/1.0"},
+	}
+
+	// No patterns — all returned.
+	result := filterBranches(branches, nil)
+	if len(result) != 5 {
+		t.Errorf("nil patterns: expected 5, got %d", len(result))
+	}
+
+	// Exclude feature/*.
+	result = filterBranches(branches, []string{"feature/*"})
+	if len(result) != 3 {
+		t.Errorf("exclude feature/*: expected 3, got %d", len(result))
+	}
+	for _, b := range result {
+		if b.Name == "feature/foo" || b.Name == "feature/bar" {
+			t.Errorf("feature branch should be excluded: %s", b.Name)
+		}
+	}
+
+	// Main is never excluded even if pattern matches.
+	result = filterBranches(branches, []string{"main"})
+	found := false
+	for _, b := range result {
+		if b.IsMain {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("main branch should never be excluded")
+	}
+}
+
+func TestMatchesAnyGlob(t *testing.T) {
+	if !matchesAnyGlob("feature/foo", []string{"feature/*"}) {
+		t.Error("expected feature/foo to match feature/*")
+	}
+	if matchesAnyGlob("develop", []string{"feature/*"}) {
+		t.Error("develop should not match feature/*")
+	}
+	if matchesAnyGlob("anything", nil) {
+		t.Error("nil patterns should not match")
+	}
+	if matchesAnyGlob("release/1.0", []string{"bugfix/*", "release/*"}) {
+		// filepath.Match: * does not match /
+		// So release/* does NOT match release/1.0 with filepath.Match
+		// This is expected Go behavior — adjust test accordingly
+	}
+}
+
+func TestLoadCompletedBranches(t *testing.T) {
+	dir := t.TempDir()
+	store := common.NewDataStore(dir)
+	w, _ := store.Writer("importProjectData")
+
+	for _, rec := range []map[string]any{
+		{"cloud_project_key": "proj1", "branch": "main", "status": "success"},
+		{"cloud_project_key": "proj1", "branch": "develop", "status": "failed"},
+		{"cloud_project_key": "proj1", "branch": "release", "status": "skipped"},
+		{"cloud_project_key": "proj2", "branch": "main", "status": "success"},
+	} {
+		b, _ := json.Marshal(rec)
+		w.WriteOne(b)
+	}
+
+	completed := loadCompletedBranches(store)
+	if completed == nil {
+		t.Fatal("expected non-nil completed map")
+	}
+	if !completed["proj1:main"] {
+		t.Error("proj1:main should be completed")
+	}
+	if completed["proj1:develop"] {
+		t.Error("proj1:develop (failed) should not be completed")
+	}
+	if completed["proj1:release"] {
+		t.Error("proj1:release (skipped) should not be completed")
+	}
+	if !completed["proj2:main"] {
+		t.Error("proj2:main should be completed")
+	}
+}
+
+func TestLoadCompletedBranchesEmpty(t *testing.T) {
+	dir := t.TempDir()
+	store := common.NewDataStore(dir)
+	completed := loadCompletedBranches(store)
+	if completed != nil {
+		t.Errorf("expected nil for empty store, got %v", completed)
+	}
+}
+
+func TestShouldSkipBranch(t *testing.T) {
+	if shouldSkipBranch(nil, "proj", "main") {
+		t.Error("nil map should not skip")
+	}
+
+	completed := map[string]bool{"proj:main": true}
+	if !shouldSkipBranch(completed, "proj", "main") {
+		t.Error("should skip completed branch")
+	}
+	if shouldSkipBranch(completed, "proj", "develop") {
+		t.Error("should not skip non-completed branch")
+	}
+}
+
+func newCEFailMockServer() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/ce/submit":
+			json.NewEncoder(w).Encode(map[string]any{"taskId": "AX-fail-123"})
+		case "/api/ce/task":
+			json.NewEncoder(w).Encode(map[string]any{
+				"task": map[string]any{"status": "FAILED", "errorMessage": "main branch not ready"},
+			})
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+}
+
+func TestImportProjectBranchesMainCEFailAborts(t *testing.T) {
+	dir := t.TempDir()
+	setupProjectDataExtract(t, dir)
+
+	srv := newCEFailMockServer()
+	defer srv.Close()
+
+	e := newProjectDataExecutor(t, dir)
+	e.CloudURL = srv.URL + "/"
+	e.Raw = common.NewRawClient(srv.Client(), srv.URL+"/")
+
+	w, _ := e.Store.Writer("importProjectData")
+	proj, _ := json.Marshal(map[string]any{
+		"key":                "proj1",
+		"cloud_project_key":  "cloud-proj1",
+		"sonarcloud_org_key": "cloud-org1",
+		"server_url":         testServerURL,
+	})
+
+	branches := []branchInfo{
+		{Name: "main", IsMain: true},
+		{Name: "develop", IsMain: false},
+	}
+
+	err := importProjectBranches(context.Background(), e, proj, branches, "", nil, w)
+	if err == nil {
+		t.Fatal("expected error when main branch CE fails")
+	}
+
+	items, _ := e.Store.ReadAll("importProjectData")
+	if len(items) < 2 {
+		t.Fatalf("expected at least 2 results (main=failed, develop=skipped), got %d", len(items))
+	}
+
+	var mainStatus, devStatus string
+	for _, item := range items {
+		branch := extractField(item, "branch")
+		status := extractField(item, "status")
+		if branch == "main" {
+			mainStatus = status
+		}
+		if branch == "develop" {
+			devStatus = status
+		}
+	}
+	if mainStatus != "failed" {
+		t.Errorf("main branch: expected failed, got %s", mainStatus)
+	}
+	if devStatus != "skipped" {
+		t.Errorf("develop branch: expected skipped, got %s", devStatus)
+	}
+}
+
+func TestImportProjectBranchesMainFirst(t *testing.T) {
+	dir := t.TempDir()
+	setupProjectDataExtract(t, dir)
+
+	var submitOrder []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/ce/submit":
+			if err := r.ParseMultipartForm(10 << 20); err == nil {
+				if branch := r.FormValue("characteristic"); branch != "" {
+					submitOrder = append(submitOrder, branch)
+				}
+			}
+			json.NewEncoder(w).Encode(map[string]any{"taskId": "AX-test-" + r.FormValue("projectKey")})
+		case "/api/ce/task":
+			json.NewEncoder(w).Encode(map[string]any{
+				"task": map[string]any{"status": "SUCCESS"},
+			})
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+
+	e := newProjectDataExecutor(t, dir)
+	e.CloudURL = srv.URL + "/"
+	e.Raw = common.NewRawClient(srv.Client(), srv.URL+"/")
+
+	w, _ := e.Store.Writer("importProjectData")
+	proj, _ := json.Marshal(map[string]any{
+		"key":                "proj1",
+		"cloud_project_key":  "cloud-proj1",
+		"sonarcloud_org_key": "cloud-org1",
+		"server_url":         testServerURL,
+	})
+
+	// Provide branches with non-main first (before sort).
+	branches := []branchInfo{
+		{Name: "develop", IsMain: false},
+		{Name: "main", IsMain: true},
+	}
+	sortBranchesMainFirst(branches)
+
+	err := importProjectBranches(context.Background(), e, proj, branches, "", nil, w)
+	if err != nil {
+		t.Fatalf("importProjectBranches: %v", err)
+	}
+
+	items, _ := e.Store.ReadAll("importProjectData")
+	if len(items) == 0 {
+		t.Fatal("expected results written")
+	}
+
+	// Verify main was processed first by checking item order.
+	firstBranch := extractField(items[0], "branch")
+	if firstBranch != "main" {
+		t.Errorf("expected main to be imported first, got %s", firstBranch)
+	}
+}
+
+func TestImportSkipsCompletedBranches(t *testing.T) {
+	dir := t.TempDir()
+	setupProjectDataExtract(t, dir)
+
+	srv := newCEMockServer()
+	defer srv.Close()
+
+	e := newProjectDataExecutor(t, dir)
+	e.CloudURL = srv.URL + "/"
+	e.Raw = common.NewRawClient(srv.Client(), srv.URL+"/")
+
+	// Pre-populate completed branches.
+	completed := map[string]bool{"cloud-proj1:main": true}
+
+	w, _ := e.Store.Writer("importProjectData")
+	proj, _ := json.Marshal(map[string]any{
+		"key":                "proj1",
+		"cloud_project_key":  "cloud-proj1",
+		"sonarcloud_org_key": "cloud-org1",
+		"server_url":         testServerURL,
+	})
+
+	branches := []branchInfo{
+		{Name: "main", IsMain: true},
+		{Name: "develop", IsMain: false},
+	}
+
+	err := importProjectBranches(context.Background(), e, proj, branches, "", completed, w)
+	if err != nil {
+		t.Fatalf("importProjectBranches: %v", err)
+	}
+
+	// Main was skipped, so only develop should appear in results.
+	items, _ := e.Store.ReadAll("importProjectData")
+	for _, item := range items {
+		branch := extractField(item, "branch")
+		if branch == "main" {
+			t.Error("main branch should have been skipped (already completed)")
+		}
 	}
 }

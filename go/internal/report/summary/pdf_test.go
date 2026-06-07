@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package summary
 
 import (
@@ -6,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-pdf/fpdf"
 )
 
 // TestRenderPDFGlobalSettingsWrappingRow is a regression for issue
@@ -406,10 +412,10 @@ func TestUnifiedRowDisplayNameWithLanguage(t *testing.T) {
 	}
 }
 
-func TestSuccessDetailsScanHistory(t *testing.T) {
+func TestSuccessDetailsProjectData(t *testing.T) {
 	got := successDetails(EntityItem{Detail: "proj1|scan:failed"}, false, false, false)
 	if !strings.Contains(got, "proj1") || !strings.Contains(got, "Failed") {
-		t.Errorf("expected scan history in details, got %q", got)
+		t.Errorf("expected project data in details, got %q", got)
 	}
 }
 
@@ -427,6 +433,36 @@ func TestSuccessDetailsLabelProjectKey(t *testing.T) {
 	plain := successDetails(EntityItem{Detail: "acme_proj-a"}, false, false, false)
 	if plain != "acme_proj-a" {
 		t.Errorf("expected bare key, got %q", plain)
+	}
+}
+
+func TestPartialDetailsSplitsScanMarker(t *testing.T) {
+	// Regression: a Partial / NearPerfect project carrying a |scan: marker
+	// in its Detail must have the marker split off onto its own
+	// "project data:" line (like Succeeded rows) so the inline-bold span
+	// around the cloud key stays balanced and the issue lines are kept.
+	// Previously the raw marker was embedded inside the bold key, which a
+	// downstream re-split (the Markdown renderer) truncated — dropping the
+	// closing bold marker and the issue text.
+	got := partialDetails(
+		EntityItem{Detail: "proj1|scan:success", Issues: []string{"per-branch NCD dropped"}},
+		false, false, true,
+	)
+	if strings.Contains(got, "|scan:") {
+		t.Errorf("raw scan marker leaked into details: %q", got)
+	}
+	// Cloud key bold span must be balanced (one open, one close).
+	if strings.Count(got, inlineBoldStart) != 1 || strings.Count(got, inlineBoldEnd) != 1 {
+		t.Errorf("unbalanced inline-bold markers: %q", got)
+	}
+	if !strings.Contains(got, "New Project Key: "+inlineBoldStart+"proj1"+inlineBoldEnd) {
+		t.Errorf("expected labeled+bold cloud key, got %q", got)
+	}
+	if !strings.Contains(got, "project data:") {
+		t.Errorf("expected project-data line, got %q", got)
+	}
+	if !strings.Contains(got, "per-branch NCD dropped") {
+		t.Errorf("expected issue line preserved, got %q", got)
 	}
 }
 
@@ -472,5 +508,91 @@ func TestToPredictiveTenseAppliedValue(t *testing.T) {
 		if got != c.want {
 			t.Errorf("toPredictiveTense(%q, true) = %q, want %q", c.in, got, c.want)
 		}
+	}
+}
+
+// Issue #302: long inline-bold values must wrap inside the cell
+// instead of bleeding past the page right margin and continuing at
+// the page left margin (which used to clobber the Setting Key column
+// in the next row).
+func TestWrapInlineBoldLines_LongValueStaysInCell(t *testing.T) {
+	// Set up a minimal pdf with the embedded fonts so GetStringWidth
+	// returns realistic mm widths.
+	pdf := fpdf.New("P", "mm", "Letter", "")
+	registerUnicodeFont(pdf)
+	pdf.AddPage()
+
+	longVal := "**/lib/**,**/vendor/**,**/node_modules/**,**/build/**,**/dist/**,**/.gradle/**,**/target/**,**/.tox/**,**/__pycache__/**"
+	text := "Applied value=" + inlineBoldStart + longVal + inlineBoldEnd
+
+	const cellWidth = 80.0
+	const fontSize = 6.0
+
+	phys := wrapInlineBoldLines(pdf, text, cellWidth, fontSize)
+	if len(phys) < 2 {
+		t.Fatalf("expected the value to wrap to multiple physical lines, got %d", len(phys))
+	}
+	// Every line's rendered width must fit within the cell — otherwise
+	// pdf.Write would still trigger its page-margin wrap at render time.
+	for i, segs := range phys {
+		var lineW float64
+		for _, s := range segs {
+			style := ""
+			if s.bold {
+				style = "B"
+			}
+			pdf.SetFont(pdfFontFamilyBody, style, fontSize)
+			lineW += pdf.GetStringWidth(s.text)
+		}
+		if lineW > cellWidth {
+			t.Errorf("physical line %d width %.2f exceeds cellWidth %.2f", i, lineW, cellWidth)
+		}
+	}
+}
+
+// Style is preserved across the wrap boundary — the "Applied value="
+// prefix stays regular, the bold value stays bold even when the wrap
+// point falls inside it.
+func TestWrapInlineBoldLines_PreservesStyleAcrossWrap(t *testing.T) {
+	pdf := fpdf.New("P", "mm", "Letter", "")
+	registerUnicodeFont(pdf)
+	pdf.AddPage()
+
+	longBold := strings.Repeat("ABCDEF,", 30)
+	text := "Applied value=" + inlineBoldStart + longBold + inlineBoldEnd
+
+	phys := wrapInlineBoldLines(pdf, text, 60.0, 6.0)
+	if len(phys) < 2 {
+		t.Fatalf("expected multi-line wrap, got %d", len(phys))
+	}
+	// First line: should start with a regular "Applied value=" segment.
+	if len(phys[0]) == 0 || phys[0][0].bold {
+		t.Errorf("first physical line should start regular, got %+v", phys[0])
+	}
+	// Some later line should still be bold (the trailing value continues).
+	sawBold := false
+	for _, segs := range phys[1:] {
+		for _, s := range segs {
+			if s.bold {
+				sawBold = true
+			}
+		}
+	}
+	if !sawBold {
+		t.Error("bold attribute should carry across the wrap to the trailing lines")
+	}
+}
+
+// A short value still renders on a single physical line — the new
+// wrap path mustn't regress the common case.
+func TestWrapInlineBoldLines_ShortValueOneLine(t *testing.T) {
+	pdf := fpdf.New("P", "mm", "Letter", "")
+	registerUnicodeFont(pdf)
+	pdf.AddPage()
+
+	text := "Applied value=" + inlineBoldStart + "true" + inlineBoldEnd
+	phys := wrapInlineBoldLines(pdf, text, 80.0, 6.0)
+	if len(phys) != 1 {
+		t.Errorf("short value should fit on one line, got %d", len(phys))
 	}
 }

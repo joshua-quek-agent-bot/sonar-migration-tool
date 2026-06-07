@@ -18,7 +18,7 @@ Migration tool: `go/internal/`
 
 **Status**: FIXED — commits `e769b95` and `21d74e8` on branch `fix/history-creation-date-fix` (merged to main via PR #291). `BackdateChangesets` is now called with both native AND external issues. `extIssuesToExtracted()` was added as a helper that properly maps external issue creation dates. The date-map key mismatch (BUG-04/BUG-15) was also resolved as part of this fix.
 
-~~**File**: [go/internal/migrate/tasks_scanhistory.go](../go/internal/migrate/tasks_scanhistory.go)~~
+~~**File**: [go/internal/migrate/tasks_projectdata.go](../go/internal/migrate/tasks_projectdata.go)~~
 ~~**Severity**: P0 — all migrated issues get wrong creation dates~~
 
 ~~**Progress note (2026-05-30)**: Commit `e71b690` wired up the original creation date flow for changeset construction, but `BackdateChangesets` and `toExtractedIssues` may still not be called from `importBranch()` in the final form. Verify the current state of the task before proceeding with the full fix.~~
@@ -50,7 +50,7 @@ scanreport.BackdateChangesets(extracted, changesetsByComponent, now)
 <!-- updated: 2026-06-04_01:14:00.000 by Claude -->
 
 **File**: [go/internal/scanreport/builder.go:294](../go/internal/scanreport/builder.go#L294),
-[go/internal/migrate/tasks_scanhistory.go:588](../go/internal/migrate/tasks_scanhistory.go#L588)
+[go/internal/migrate/tasks_projectdata.go:588](../go/internal/migrate/tasks_projectdata.go#L588)
 
 `ActiveRuleInput` struct only has `RuleRepo`, `RuleKey`, `Severity`, `QProfileKey`, `Language`.
 `BuildActiveRules()` only sets `RuleRepository`, `RuleKey`, `Severity`, `QProfileKey` on the
@@ -75,12 +75,12 @@ Reliability, Security) won't reflect the source configuration.
 
 ---
 
-### ~~BUG-03: `ReferenceBranchName` never set in `MetadataInput` inside `importBranch`~~ **[FIXED]**
-<!-- updated: 2026-06-04_01:14:00.000 by Claude -->
+### ~~BUG-03: `ReferenceBranchName` never set in `MetadataInput` inside `importBranch`~~ **[FIXED — main; COMPLETED — non-main]**
+<!-- updated: 2026-06-05_19:20:00 -->
 
-**Status**: FIXED — commit `1eeb9d8`. `MetadataInput` now includes `ReferenceBranchName`; `BuildMetadata` sets it on the protobuf `Metadata` message, defaulting to `BranchName` if not explicitly provided. This matches CloudVoyager's behavior and resolves the CE processing rejection.
+**Status**: FIXED (main) — commit `1eeb9d8` added `ReferenceBranchName` to `MetadataInput`; `BuildMetadata` writes it to protobuf `Metadata` field 11 (`reference_branch_name`, = SonarCloud's `merge_branch_name`), defaulting to `BranchName` when unset. **COMPLETED (non-main)** — branch `fix/issue-104-migrate-multiple-branches`: that 2024 fix only ever set the field for the main branch (which self-references harmlessly because it sends no branch characteristic). Non-main branches kept self-referencing — exactly the `(For non-main branches it should be the main branch name.)` note that was struck through but never implemented. `importBranch` now sets `ReferenceBranchName` = the project's main branch for non-main branches (via `resolveMainTargetName` → `branchImportContext.MainTargetName` → `importBranchInput.ReferenceBranch`). **Verified live against SonarCloud staging**: this flips the CE from hard-rejection ("issue whilst processing the report") to **SUCCESS** for non-main branches whose names match the long-lived branch pattern (e.g. `release-3.x`, `reduce-tech-debt` went FAILED → SUCCESS). The main branch is unchanged (still imports 1292 issues). This reference-branch fix is necessary but not sufficient on its own; **see BUG-17** for the create-analysis handshake that completes non-main branch persistence (now fixed — branches land with full issue history).
 
-~~**File**: [go/internal/migrate/tasks_scanhistory.go:200](../go/internal/migrate/tasks_scanhistory.go#L200)~~
+~~**File**: [go/internal/migrate/tasks_projectdata.go:200](../go/internal/migrate/tasks_projectdata.go#L200)~~
 
 ~~`BuildMetadata()` accepts `ReferenceBranchName` (field in `MetadataInput`) and propagates it
 to the protobuf `Metadata.ReferenceBranchName`. However `importBranch()` constructs
@@ -105,7 +105,7 @@ to the protobuf `Metadata.ReferenceBranchName`. However `importBranch()` constru
 
 **Status**: FIXED — resolved as part of the BUG-01 fix (commits `e769b95` and `21d74e8`, branch `fix/history-creation-date-fix`, merged to main via PR #291). `extIssuesToExtracted()` was added as a helper that properly maps external issue creation dates, eliminating the date-map key mismatch.
 
-~~**File**: [go/internal/migrate/tasks_scanhistory.go:644](../go/internal/migrate/tasks_scanhistory.go#L644)~~
+~~**File**: [go/internal/migrate/tasks_projectdata.go:644](../go/internal/migrate/tasks_projectdata.go#L644)~~
 
 ~~`toExtractedIssues()` builds `dateMap` keyed on `iss.RuleRepo+":"+iss.RuleKey` (line 666),
 but then looks up the date using the same key. Multiple issues with the same rule on the same
@@ -240,7 +240,7 @@ marker to maintain compatibility.
 <!-- updated: 2026-06-04_01:14:00.000 by Claude -->
 
 **File**: [go/internal/scanreport/packager.go](../go/internal/scanreport/packager.go),
-[go/internal/migrate/tasks_scanhistory.go](../go/internal/migrate/tasks_scanhistory.go)
+[go/internal/migrate/tasks_projectdata.go](../go/internal/migrate/tasks_projectdata.go)
 
 `ReportData` struct has no `Duplications` field. `PackageReport()` does not write any
 `duplications-{ref}.pb` files. The extraction phase extracts duplicate data (it's part of
@@ -253,23 +253,111 @@ the component tree in SQ's API) but it's discarded.
 ---
 
 ### BUG-11: No measures data included in protobuf report
-<!-- updated: 2026-06-04_01:14:00.000 by Claude -->
+<!-- updated: 2026-06-04_12:00:00 -->
 
-**File**: [go/internal/migrate/tasks_scanhistory.go:218](../go/internal/migrate/tasks_scanhistory.go#L218)
+**File**: [go/internal/migrate/tasks_projectdata.go:218](../go/internal/migrate/tasks_projectdata.go#L218)
+**Tracking**: [GitHub Issue #106](https://github.com/sonar-solutions/sonar-migration-tool/issues/106) — **Implementation plan**: [PLAN-FIX-106.md](../PLAN-FIX-106.md)
 
 `reportData.Measures` is initialized as `make(map[int32][]*pb.Measure)` (empty map) and
-never populated. There is no `loadExtractedMeasures()` function.
+never populated. There is no `loadExtractedMeasures()` function. The protobuf infrastructure
+(`BuildMeasures()`, `addMeasures()`, `Measure` proto message) is fully built and tested — only
+the wiring in `importBranch()` and the extract metric key expansion are missing.
 
 **CloudVoyager**: builds measures from `buildMeasures()` covering lines, complexity, coverage,
-issues, bugs, etc.
+issues, bugs, etc. Encodes file-level measures into `measures-{ref}.pb` protobuf files grouped
+by component ref. Uses a `STRING_METRICS` allowlist and int32/int64 range splitting.
 
 **Impact**: All code metrics (lines of code, coverage, complexity, etc.) in SC will be zero
 or absent after migration — only live scans will populate them.
 
+**Fix summary** (see [PLAN-FIX-106.md](../PLAN-FIX-106.md) for full details):
+1. Expand `projectComponentTreeTask()` to request ~35 metric keys (not just `ncloc`)
+2. Fix `buildMeasureValue()` for LongValue and string metric handling
+3. Add `loadExtractedComponentMeasures()` in migrate phase
+4. Wire `BuildMeasures()` into `importBranch()` and populate `ReportData.Measures`
+
+---
+
+### BUG-16: Multi-branch migration ordering and reliability (6 sub-bugs)
+<!-- updated: 2026-06-04_15:00:00 -->
+
+**Status**: **FIXED** — branch `fix/issue-104-migrate-multiple-branches`. Six bugs related to multi-branch project data import were identified and fixed in `tasks_projectdata.go`:
+
+1. **BUG-16a (Critical): Main branch not guaranteed first** — `sortBranchesMainFirst()` now ensures the main branch is always uploaded before non-main branches. Previously, branch ordering was non-deterministic, which could cause CE to reject non-main branch uploads if the main branch hadn't been imported yet.
+
+2. **BUG-16b+c (Critical/High): No CE gate between main and non-main branches** — `importProjectBranches` was restructured into two phases: (1) import the main branch first and wait for CE SUCCESS, (2) only then import non-main branches. If the main branch CE task fails, all non-main branches are marked "skipped" and the project is aborted. This matches CloudVoyager's sequencing behavior.
+
+3. **BUG-16d (Medium): No branch filtering** — Added `ExcludeBranches` config option (glob patterns via `filepath.Match`) to skip non-main branches during project data import. Available as `--exclude_branches` CLI flag and `exclude_branches` JSON config key. The main branch is never excluded regardless of patterns.
+
+4. **BUG-16e (Medium): No per-branch checkpoint/resume** — Added `loadCompletedBranches()` and `shouldSkipBranch()` to read existing `importProjectData` results and skip branches that already succeeded on resume. Previously, resuming a failed run would re-import branches that had already completed successfully.
+
+5. **BUG-16f (Medium): Project-level concurrency not properly managed** — Rewrote `runImportProjectData` to use `errgroup.WithContext` + `g.SetLimit(cap(e.Sem))` for parallel project processing. Individual project failures no longer cancel other projects (settled semantics).
+
+**Files changed**: `tasks_projectdata.go`, `tasks_projectdata_test.go` (12 new tests), `migrate.go`, `config_file.go`, `config_file_test.go`, `cmd/migrate.go`, `cmd/transfer.go`, `cmd/transfer_test.go`.
+
+---
+
+### ~~BUG-17: Non-main branches accepted by the CE but not persisted on SonarCloud~~ **[FIXED]**
+<!-- updated: 2026-06-05_19:15:00 -->
+
+**Status**: **FIXED** — branch `fix/issue-104-migrate-multiple-branches`. Root cause: the tool POSTed the report straight to `/api/ce/submit`, but a real SonarCloud scanner first performs a server-side **"Create analysis" handshake** that anchors the branch row and returns an `analysisUuid`, which it stamps into the report's `metadata.analysis_uuid` (proto **field 19**). The CE binds an uploaded report to a branch **solely** via that `analysis_uuid`; our reports omitted it (our vendored proto even *reserved* field 19), so the CE processed the report (task SUCCESS) but never created the branch.
+
+**Fix** (captured from the real scanner via mitmproxy + confirmed by a live `201`):
+- `scanner-report.proto`: un-reserved field 19 → `string analysis_uuid = 19;` (regenerated).
+- `submit.go`: added `PreCreateAnalysis(ctx, client, AnalysisConfig)` → `POST {APIURL}/analysis/analyses` (the api host, **no `/api/v2` prefix**; Bearer; JSON `{organizationKey, projectKey, projectVersion, branchName, targetBranchName, branchType}`) → returns `{"id": <analysisUuid>, ...}`.
+- `tasks_projectdata.go` `buildBranchReport`: for **non-main** branches, calls the handshake (via `e.RawAPI.HTTPClient()` + `e.APIURL`) with **`branchType:"long"`** and stamps the returned `analysisUuid` into the metadata. The main branch needs no handshake. `/api/ce/submit` is unchanged (still `branchType=LONG`).
+- **`branchType:"long"` for every migrated branch** so they are long-lived and keep full issue history — SonarCloud auto-prunes *short-lived* branches after ~30 days.
+
+**Live verification** (SC staging, `open-digital-society-1_okorach-oss_sonar-tools`): non-main branches now **persist as LONG with full issue history** — `release-3.x` 1511 issues, `reduce-tech-debt` 1290, `my-test` 831 (all `type=LONG`); previously 0 / not listed. `develop` + `feat/add-ruff-linting` are gracefully skipped (source purged — see BUG-18).
+
+The historical analysis below concluded this was an unfixable injection limitation — that was **wrong**; the missing piece was the create-analysis handshake.
+
+~~(historical) **Status**: OPEN — strongly evidenced to be a **limitation of the report-injection approach on SonarCloud**, not a code bug fixable by tweaking the report alone.~~
+
+**Symptom**: After the BUG-03 completion, a non-main branch report POSTed to `/api/ce/submit` with `characteristic=branch=<name>` + `characteristic=branchType=LONG` and metadata `reference_branch_name=<main>` returns CE task **SUCCESS**, but the branch never materializes:
+- `/api/project_branches/list` shows only the main branch.
+- `/api/project_analyses/search?branch=<name>` → `Component ... on branch '<name>' not found`.
+- The branch reports 0 issues.
+
+**Live evidence** (project `open-digital-society-1_okorach-oss_sonar-tools`, SC staging, branch `fix/issue-104-migrate-multiple-branches`):
+
+| Branch | Long-lived pattern? | CE result | Persisted? |
+|--------|---------------------|-----------|------------|
+| `master` (main) | yes | SUCCESS | ✅ 1292 issues |
+| `release-3.x` | yes (`release-.*`) | SUCCESS (was FAILED) | ❌ not found |
+| `develop` | yes (`develop`) | **FAILED** | ❌ |
+| `reduce-tech-debt` | no → SHORT | SUCCESS | ❌ (short-lived: PR-like, never persisted) |
+
+**Findings**:
+1. **`branchType=LONG` is correct.** The SC main branch reports `type=LONG` in `/api/project_branches/list`, and a real `sonar-scanner` submitting to sc-staging.io sends `characteristic=branchType=LONG` (Sonar support ticket #14210). Do **not** change it to `BRANCH`.
+2. **Branch classification/persistence is server-side**, governed by the long-lived branch name pattern (`sonar.branch.longLivedBranches.regex`, here `(comma,branch|develop|main|master|release-.*|trunk)`) on first analysis — not by the injected `branchType`. Names that don't match are treated as short-lived (PR-like, auto-deleted, no overall-code branch).
+3. **Raw report injection via `/api/ce/submit` is not a supported branch-creation path** (per Sonar internal guidance + public docs). The real scanner performs additional branch orchestration (fetches branch config from the server, computes the reference branch, ships real SCM/changeset data); a handcrafted report appears to omit whatever the CE needs to materialize the branch entity.
+4. **CloudVoyager also never moved a non-main branch here** (`syncAllBranches:true` notwithstanding), consistent with this being inherent to the injection approach rather than tool-specific.
+
+**Side effect to address**: the tool currently records branches in (2)/(3) as `status=success` in `importProjectData` results even though no data lands — over-reporting. A post-submit `/api/project_branches/list` verification would make the reported status accurate.
+
+---
+
+### BUG-18: Report-validity hardening (the `develop` hard-failure) — **[FIXED]**
+<!-- updated: 2026-06-05_14:40:00 -->
+
+**Status**: FIXED — branch `fix/issue-104-migrate-multiple-branches`. While BUG-17 covers branches the CE *accepts* but doesn't persist, `develop` on `okorach-oss_sonar-tools` was *hard-rejected* by the CE (~6s, generic error) where the structurally similar `release-3.x` succeeded. Byte/proto-diffing the two built reports (offline, via a temporary `SMT_DUMP_REPORT_DIR` dump — since removed) isolated three problems in `develop`, all absent from `release-3.x`:
+
+1. **Source text purged (root cause).** The `develop` branch has **line measures but no retrievable source text**. Both `/api/sources/raw` and `/api/sources/lines` (the endpoint the SonarQube UI uses to render a file) return **0 lines** for every develop file — e.g. `sonar/projects.py` reports `ncloc=1193` yet `sources/lines=0` — while `release-3.x` returns full source (projects.py: 1717 lines). All 96 of develop's extracted `source-*.txt` were 0 bytes (release-3.x: 942 KB). **Why:** develop was last analyzed **2025-05-01** (13+ months ago) vs release-3.x **2025-10-25** and master **2026-05-11**; SonarQube housekeeping purges source/SCM data for old/inactive branches while retaining aggregate measures and issues. The project's **Code list** in the UI still shows develop's LOC (13,942) because that is a *measure* — but opening any develop file shows an empty source view. This is a **source-side data condition (purged source), not an extraction bug** — confirmed against `/api/sources/lines`, the UI's own endpoint.
+2. **Out-of-range issue lines.** With no source, component line counts fell back to **ncloc** (e.g. `sonar/tasks.py` declared 288 lines) while issues referenced physical lines up to 381 → 29 `range_exceeds_lines` → CE reject.
+3. **Orphan rule.** A native `secrets:S6702` issue referenced a rule never extracted into `activerules.pb` (the `secrets` repo isn't among the project's active-rule repos) → CE reject.
+
+**Fixes (all in `tasks_projectdata.go`, with tests)** — defensive, so they also harden **main-branch** migration of any project with the same gaps:
+- `fixComponentLineCounts` now raises each component's line count to at least the largest line any issue points at (`maxIssueEndLineByComponent`), never below it.
+- `dropIssuesWithInactiveRules` drops native issues whose `(repo, key)` is not in the active-rule set (an issue on an unactivated rule aborts the whole report and can't be recreated anyway). Hotspots are exempt.
+- **Purged-source skip**: a branch with findings but **zero** retrievable source text (`totalSourceLen == 0`) is now **skipped** with a clear status (`"source code not retrievable for this branch (line measures may remain, but source text is gone — likely purged by SonarQube housekeeping); re-analyze the branch on the source server to migrate it"`) instead of submitting a doomed report. Issues with no source cannot be anchored to lines, and the CE requires source.
+
+**Net for `develop`**: the report is now structurally clean (0 out-of-range, 0 orphan rules — verified by proto-diff), but because its source text has been purged on the server, the tool now **skips it cleanly** with an actionable message rather than hard-failing. To actually migrate develop, re-analyze it on the source server first (which restores its source), then re-run. (Even a structurally valid `develop` report would not persist — see BUG-17.) `importBranch` was also refactored into `importBranch` + `buildBranchReport` + `fixComponentLineCounts` to keep cognitive complexity within the project bar.
+
 ---
 
 ## P2 — Missing Features (Present in CloudVoyager, Absent Here)
-<!-- updated: 2026-06-04_01:14:00.000 by Claude -->
+<!-- updated: 2026-06-04_15:00:00 -->
 
 ### FEAT-01: No user-mappings.csv support
 <!-- updated: 2026-06-04_01:14:00.000 by Claude -->
@@ -285,7 +373,7 @@ all assignee data is lost (BUG-05 is a symptom).
 ### FEAT-02: No changelog extraction for issues
 <!-- updated: 2026-06-04_01:14:00.000 by Claude -->
 
-**File**: [go/internal/extract/tasks_scanhistory.go](../go/internal/extract/tasks_scanhistory.go)
+**File**: [go/internal/extract/tasks_projectdata.go](../go/internal/extract/tasks_projectdata.go)
 
 The extraction phase fetches `getProjectIssuesFull` but does not include issue changelog
 data (`/api/issues/search?additionalFields=_all` includes `changelog`). CloudVoyager
@@ -354,6 +442,20 @@ semantic group. Users can't easily say "only sync issues, skip everything else."
 
 ---
 
+### ~~FEAT-08a: No project version migration~~ **[FIXED]**
+<!-- updated: 2026-06-04_15:30:00 -->
+
+**Status**: FIXED — Issue #102. The `getProjectVersions` extract task fetches the current project version per branch via `/api/navigation/component`. During project data import, the extracted version is passed to both the protobuf metadata and the CE submit form. Falls back to `"1.0.0"` if not available (matching CloudVoyager behavior). Harvested from CloudVoyager's `resolve-source-project-version.js`. Additionally, `resolveProjectVersion` normalizes the SonarQube sentinel string `"not provided"` (returned when no `sonar.projectVersion` is configured) to empty string, so the `"1.0.0"` fallback triggers correctly.
+
+~~CloudVoyager resolves the source project version via `resolve-source-project-version.js`
+and passes `sonar.projectVersion` to both the protobuf metadata and the CE submit form.
+The migration tool did not extract or set the project version.~~
+
+~~**Impact**: Projects migrated to SonarQube Cloud had no project version set, losing version
+tracking metadata.~~
+
+---
+
 ### FEAT-08: Incremental transfer mode absent
 <!-- updated: 2026-06-04_01:14:00.000 by Claude -->
 
@@ -382,7 +484,7 @@ pattern.
 ### ~~FEAT-10: `--url` default silently targets production~~ **[FIXED]**
 <!-- updated: 2026-06-04_01:14:00.000 by Claude -->
 
-**Status**: FIXED — `--sc-url` flag was added to the transfer command. The default no longer silently targets production. Users can pass `--sc-url https://sc-staging.io` for staging.
+**Status**: FIXED — `--target_url` flag was added to the transfer command (renamed from `--sc-url` in #295). The default no longer silently targets production. Users can pass `--target_url https://sc-staging.io` for staging.
 
 ~~**File**: [go/internal/migrate/migrate.go:190](../go/internal/migrate/migrate.go#L190)~~
 
@@ -400,31 +502,31 @@ to https://sonarcloud.io/ — pass --url to target a different instance"`.~~
 ## P3 — Internal Quality / Robustness Gaps
 <!-- updated: 2026-06-04_01:14:00.000 by Claude -->
 
-### BUG-12: `getActiveProfileRules` not included in scan-history-only extract
+### BUG-12: `getActiveProfileRules` not included in project-data-only extract
 <!-- updated: 2026-06-04_01:14:00.000 by Claude -->
 
 **File**: [go/internal/extract/planner.go](../go/internal/extract/planner.go)
 
-`TargetTasksWithScanHistory()` adds: `getProjectIssuesFull`, `getProjectComponentTree`,
+`TargetTasksWithProjectData()` adds: `getProjectIssuesFull`, `getProjectComponentTree`,
 `getProjectSourceCode`, `getProjectSCMData`, `getProjectHotspotsFull` — but NOT
 `getActiveProfileRules` or `getQualityProfiles`.
 
-`loadExtractedActiveRules()` reads from `getActiveProfileRules`. If a user runs
-`extract --include_scan_history` without also running a full extract first, active rules
+`loadExtractedActiveRules()` reads from `getActiveProfileRules`. If a user runs a
+project-data-only extract without also running a full extract first, active rules
 data will be absent and all `pbActiveRules` will be empty.
 
 **Impact**: Protobuf reports won't include active rules, causing CE to use default rules
 — incorrect quality gate behavior.
 
 **Fix**: Add `getActiveProfileRules` (and its dependency `getQualityRules`) to
-`TargetTasksWithScanHistory()`.
+`TargetTasksWithProjectData()`.
 
 ---
 
 ### BUG-13: Analysis date always `time.Now()` instead of extraction timestamp
 <!-- updated: 2026-06-04_01:14:00.000 by Claude -->
 
-**File**: [go/internal/migrate/tasks_scanhistory.go:198](../go/internal/migrate/tasks_scanhistory.go#L198)
+**File**: [go/internal/migrate/tasks_projectdata.go:198](../go/internal/migrate/tasks_projectdata.go#L198)
 
 ```go
 now := time.Now()
@@ -473,35 +575,41 @@ systematic wrong dates for projects with multiple issues of the same rule.~~
 ---
 
 ## Summary Table
-<!-- updated: 2026-06-04_01:14:00.000 by Claude -->
+<!-- updated: 2026-06-04_15:00:00 -->
 
 | ID | Severity | Area | Description |
 |----|----------|------|-------------|
-| BUG-01 | ~~P0~~ **FIXED** | Scan History | ~~`BackdateChangesets` never called~~ Fixed in commits `e769b95`/`21d74e8` (PR #291) |
-| BUG-02 | P0 | Scan History | `ActiveRuleInput` missing `ParamsByKey`, `CreatedAt`, `UpdatedAt`, `Impacts` |
-| BUG-03 | ~~P0~~ **FIXED** | Scan History | ~~`ReferenceBranchName` never set in `MetadataInput`~~ Fixed in commit `1eeb9d8` |
-| BUG-04 | ~~P1~~ **FIXED** | Scan History | ~~`toExtractedIssues` date lookup keyed on rule key, not issue key~~ Fixed in commits `e769b95`/`21d74e8` (PR #291) |
+| BUG-01 | ~~P0~~ **FIXED** | Project Data | ~~`BackdateChangesets` never called~~ Fixed in commits `e769b95`/`21d74e8` (PR #291) |
+| BUG-02 | P0 | Project Data | `ActiveRuleInput` missing `ParamsByKey`, `CreatedAt`, `UpdatedAt`, `Impacts` |
+| BUG-03 | ~~P0~~ **FIXED** | Project Data | ~~`ReferenceBranchName` never set in `MetadataInput`~~ Fixed in commit `1eeb9d8` |
+| BUG-04 | ~~P1~~ **FIXED** | Project Data | ~~`toExtractedIssues` date lookup keyed on rule key, not issue key~~ Fixed in commits `e769b95`/`21d74e8` (PR #291) |
 | BUG-05 | P1 | Issue Sync | `Assignee` loaded but never synced |
 | BUG-06 | P1 | Issue+Hotspot Sync | No source-link comment added back to SQ |
 | BUG-07 | P2 | Issue Sync | Issue comment format differs from CloudVoyager convention |
 | BUG-08 | ~~P1~~ **FIXED** | Hotspot Sync | ~~`TO_REVIEW` hotspots not synced~~ Fixed (confirmed in TROUBLESHOOTING.md) |
 | BUG-09 | P1 | Hotspot Sync | Metadata marker incompatible with CloudVoyager marker |
-| BUG-10 | P1 | Scan History | No duplication data in protobuf report |
-| BUG-11 | P1 | Scan History | No measures data in protobuf report |
+| BUG-10 | P1 | Project Data | No duplication data in protobuf report |
+| BUG-11 | P1 | Project Data | No measures data in protobuf report |
 | FEAT-01 | P1 | Issue+Hotspot Sync | No `user-mappings.csv` support |
 | FEAT-02 | P1 | Extract | No changelog extraction for issues |
 | FEAT-03 | P2 | CLI | No `--dry-run` mode |
 | FEAT-04 | P2 | CLI | No post-migration verification command |
-| FEAT-05 | P2 | Scan History | No CE submission retry logic |
+| FEAT-05 | P2 | Project Data | No CE submission retry logic |
 | FEAT-06 | P2 | Hotspot Sync | No hotspot assignment sync |
 | FEAT-07 | P2 | CLI | No `--only` selective migration flag |
+| FEAT-08a | ~~P2~~ **FIXED** | Project Data | ~~No project version migration~~ Fixed: Issue #102, harvested from CloudVoyager's `resolve-source-project-version.js` |
 | FEAT-08 | P3 | CLI | No incremental transfer mode |
 | FEAT-09 | P2 | Issue Sync | `syncIssueMetadata` writes no per-project output file |
-| FEAT-10 | ~~P2~~ **FIXED** | CLI | ~~`--url` default silently targets production~~ Fixed: `--sc-url` flag added to transfer command |
-| BUG-12 | P1 | Extract | `getActiveProfileRules` missing from scan-history-only extract |
-| BUG-13 | P2 | Scan History | Analysis date is migration time, not extraction timestamp |
+| FEAT-10 | ~~P2~~ **FIXED** | CLI | ~~`--url` default silently targets production~~ Fixed: `--target_url` flag added to transfer command (renamed from `--sc-url` in #295) |
+| BUG-12 | P1 | Extract | `getActiveProfileRules` missing from project-data-only extract |
+| BUG-13 | P2 | Project Data | Analysis date is migration time, not extraction timestamp |
 | BUG-14 | P3 | Hotspot Sync | No inter-comment delay for rate-limit protection |
-| BUG-15 | ~~P1~~ **FIXED** | Scan History | ~~`toExtractedIssues` date map uses wrong key~~ Fixed in commits `e769b95`/`21d74e8` (PR #291) |
+| BUG-15 | ~~P1~~ **FIXED** | Project Data | ~~`toExtractedIssues` date map uses wrong key~~ Fixed in commits `e769b95`/`21d74e8` (PR #291) |
+| BUG-16a | ~~P0~~ **FIXED** | Project Data | ~~Main branch not guaranteed first in multi-branch import~~ Fixed: `sortBranchesMainFirst()` |
+| BUG-16b+c | ~~P0~~ **FIXED** | Project Data | ~~No CE gate between main and non-main branch imports~~ Fixed: two-phase import with CE wait |
+| BUG-16d | ~~P1~~ **FIXED** | Project Data | ~~No branch filtering support~~ Fixed: `--exclude_branches` glob patterns |
+| BUG-16e | ~~P1~~ **FIXED** | Project Data | ~~No per-branch checkpoint/resume~~ Fixed: `loadCompletedBranches()` + `shouldSkipBranch()` |
+| BUG-16f | ~~P1~~ **FIXED** | Project Data | ~~Project-level concurrency not properly managed~~ Fixed: `errgroup.WithContext` + `SetLimit` |
 
 ---
 
@@ -516,8 +624,8 @@ systematic wrong dates for projects with multiple issues of the same rule.~~
 6. **BUG-05 + FEAT-01** — Add user-mappings.csv + `syncIssueAssignment()`
 7. **BUG-06** — Add source-link comments to both issue and hotspot sync
 8. **FEAT-09** — Add per-project output file to `syncIssueMetadata`
-9. **BUG-12** — Add `getActiveProfileRules` to scan-history extract task list
-10. ~~**FEAT-10**~~ — ~~Add URL default warning~~ **DONE** (`--sc-url` flag added to transfer command)
+9. **BUG-12** — Add `getActiveProfileRules` to project-data extract task list
+10. ~~**FEAT-10**~~ — ~~Add URL default warning~~ **DONE** (`--target_url` flag added to transfer command (renamed from `--sc-url` in #295))
 11. **FEAT-05** — Add CE submission retry
 12. **BUG-13** — Use extraction timestamp for analysis date
 13. **FEAT-02** — Extract issue changelog data

@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package summary
 
 import (
@@ -89,7 +93,7 @@ func TestApplyProjectFailures_DedupAndJoinDetails(t *testing.T) {
 	}
 }
 
-// Project keys carry a |scan: suffix when the project has scan history
+// Project keys carry a |scan: suffix when the project has project data
 // (#240). The matcher must look at the bare cloud key.
 func TestApplyProjectFailures_StripsScanSuffix(t *testing.T) {
 	succeeded := []EntityItem{newProjectItem("proj1", "cloud-1|scan:OK")}

@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package migrate
 
 import (
@@ -62,28 +66,72 @@ func RegisterAll() []TaskDef {
 	all = append(all, portfolioTasks()...)
 	all = append(all, ruleTasks()...)
 	all = append(all, deleteTasks()...)
-	all = append(all, scanHistoryTasks()...)
+	all = append(all, projectDataTasks()...)
 	all = append(all, hotspotMetadataSyncTasks()...)
 	all = append(all, issueMetadataSyncTasks()...)
 	return all
 }
 
-// migrateScanHistoryTasks lists task names that require the --include-scan-history flag.
-var migrateScanHistoryTasks = map[string]bool{
-	"importScanHistory":    true,
-	"syncHotspotMetadata":  true,
-	"syncIssueMetadata":    true,
+// migrateProjectDataTasks lists every task that imports or syncs
+// per-project data after the configuration migration finishes — the
+// project-data import plus the trailing issue + hotspot metadata
+// syncs. All three run by default; the operator opts out via
+// --skip_project_data_migration (#303).
+var migrateProjectDataTasks = map[string]bool{
+	"importProjectData":   true,
+	"syncHotspotMetadata": true,
+	"syncIssueMetadata":   true,
 }
 
-// MigrateTargetTasks determines which tasks to run.
-// Default: all tasks NOT starting with "get", "delete", or "reset".
-func MigrateTargetTasks(reg map[string]*TaskDef, targetTask string, skipProfiles, includeScanHistory bool) []string {
+// migrateIssueSyncTasks lists the final per-issue / per-hotspot
+// metadata sync tasks that --skip_issue_sync (or config skip_issue_sync:
+// true) excludes. importProjectData itself stays included;
+// only the trailing sync pair is skipped. #299.
+var migrateIssueSyncTasks = map[string]bool{
+	"syncHotspotMetadata": true,
+	"syncIssueMetadata":   true,
+}
+
+// MigrateTargetTasks determines which tasks to run. Precedence:
+//  1. targetTasks — an explicit leaf list (used by the transfer command for
+//     project-scoped migration); returned as-is, dependencies are resolved
+//     transitively by ResolveDependencies.
+//  2. targetTask — a single named task.
+//  3. Default: all tasks NOT starting with "get", "delete", or "reset".
+//
+// skipIssueSync (#299) drops the trailing per-issue / per-hotspot metadata
+// sync tasks from the default set while keeping importProjectData itself.
+// skipProjectDataMigration (#303) is the wider opt-out: it drops
+// importProjectData AND the two trailing sync tasks together.
+func MigrateTargetTasks(reg map[string]*TaskDef, targetTask string, skipProfiles, includeProjectData, skipIssueSync, skipProjectDataMigration bool, targetTasks []string) []string {
+	if len(targetTasks) > 0 {
+		// Filter the explicit list against the skip gates so transfer's
+		// project-scoped target list still honors --skip_project_data_migration
+		// / --skip_issue_sync. Without this the transfer
+		// command would always run importProjectData + the syncs even
+		// when the operator opted out, because the explicit list
+		// bypassed isExcludedTask. The other gates (--skip_profiles,
+		// project-data-without-flag) don't apply to transfer's curated
+		// list, so we restrict the filter to the project-data and
+		// issue-sync membership maps.
+		out := make([]string, 0, len(targetTasks))
+		for _, name := range targetTasks {
+			if skipProjectDataMigration && migrateProjectDataTasks[name] {
+				continue
+			}
+			if skipIssueSync && migrateIssueSyncTasks[name] {
+				continue
+			}
+			out = append(out, name)
+		}
+		return out
+	}
 	if targetTask != "" {
 		return []string{targetTask}
 	}
 	var tasks []string
 	for name := range reg {
-		if isExcludedTask(name, skipProfiles, includeScanHistory) {
+		if isExcludedTask(name, skipProfiles, includeProjectData, skipIssueSync, skipProjectDataMigration) {
 			continue
 		}
 		tasks = append(tasks, name)
@@ -94,7 +142,7 @@ func MigrateTargetTasks(reg map[string]*TaskDef, targetTask string, skipProfiles
 
 var excludePrefixes = []string{"get", "delete", "reset"}
 
-func isExcludedTask(name string, skipProfiles, includeScanHistory bool) bool {
+func isExcludedTask(name string, skipProfiles, includeProjectData, skipIssueSync, skipProjectDataMigration bool) bool {
 	for _, prefix := range excludePrefixes {
 		if strings.HasPrefix(name, prefix) {
 			return true
@@ -103,5 +151,19 @@ func isExcludedTask(name string, skipProfiles, includeScanHistory bool) bool {
 	if skipProfiles && (strings.Contains(name, "Profile") || strings.Contains(name, "profile")) {
 		return true
 	}
-	return migrateScanHistoryTasks[name] && !includeScanHistory
+	// Project-data migration is the wider gate: it covers the whole
+	// importProjectData + sync trio. Checked before --include-scan-
+	// history so a config with both set still surfaces a single
+	// "skipped" outcome rather than a confusing "include then skip"
+	// no-op.
+	if skipProjectDataMigration && migrateProjectDataTasks[name] {
+		return true
+	}
+	if migrateProjectDataTasks[name] && !includeProjectData {
+		return true
+	}
+	if skipIssueSync && migrateIssueSyncTasks[name] {
+		return true
+	}
+	return false
 }

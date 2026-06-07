@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package migrate
 
 import (
@@ -28,8 +32,21 @@ type configFileShape struct {
 	RunID              string `json:"run_id"`
 	TargetTask         string `json:"target_task"`
 	SkipProfiles       bool   `json:"skip_profiles"`
-	IncludeScanHistory bool   `json:"include_scan_history"`
-	Debug              bool   `json:"debug"`
+	IncludeProjectData bool   `json:"include_project_data"`
+	// SkipIssueSync controls whether the final per-issue / per-hotspot
+	// metadata sync runs after project-data is replayed (#299).
+	// Defaults to false (sync happens); set to true (or on / yes) to
+	// skip the sync. Pointer + custom unmarshaller so we can
+	// distinguish "absent" from "explicit false".
+	SkipIssueSync *FlexibleBool `json:"skip_issue_sync"`
+	// SkipProjectDataMigration disables the entire project-data import:
+	// importProjectData plus the trailing issue + hotspot syncs (#303).
+	// Defaults to false (data is migrated). Setting true (or on/yes)
+	// implies SkipIssueSync — there's nothing to sync against. Same
+	// FlexibleBool semantics as skip_issue_sync.
+	SkipProjectDataMigration *FlexibleBool `json:"skip_project_data_migration"`
+	Debug                    bool          `json:"debug"`
+	ExcludeBranches          []string      `json:"exclude_branches"`
 
 	// Shape 2 (command-sectioned).
 	Migrate *configFileShape `json:"migrate"`
@@ -69,16 +86,17 @@ type unifiedSourceBlock struct {
 // the unified config shape (#266). organization_key is provisional
 // for future SQC-org-to-SQC-org migration and is ignored for now.
 type unifiedTargetBlock struct {
-	URL                 string `json:"url"`
-	Token               string `json:"token"`
-	EnterpriseKey       string `json:"enterprise_key"`
-	Edition             string `json:"edition"`
-	Concurrency         int    `json:"concurrency"`
-	Timeout             int    `json:"timeout"`
-	RunID               string `json:"run_id"`
-	TargetTask          string `json:"target_task"`
-	OrganizationKey     string `json:"organization_key"`     // provisional, ignored
-	DefaultOrganization string `json:"default_organization"` // #281
+	URL                 string   `json:"url"`
+	Token               string   `json:"token"`
+	EnterpriseKey       string   `json:"enterprise_key"`
+	Edition             string   `json:"edition"`
+	Concurrency         int      `json:"concurrency"`
+	Timeout             int      `json:"timeout"`
+	RunID               string   `json:"run_id"`
+	TargetTask          string   `json:"target_task"`
+	OrganizationKey     string   `json:"organization_key"`     // provisional, ignored
+	DefaultOrganization string   `json:"default_organization"` // #281
+	ExcludeBranches     []string `json:"exclude_branches"`
 }
 
 type sonarCloudBlock struct {
@@ -142,18 +160,44 @@ func (s configFileShape) toMigrateConfig() MigrateConfig {
 			cfg.TargetTask = s.Target.TargetTask
 			cfg.Concurrency = s.Target.Concurrency
 			cfg.DefaultOrganization = s.Target.DefaultOrganization
+			cfg.ExcludeBranches = s.Target.ExcludeBranches
 		}
 		if cfg.Concurrency == 0 {
 			cfg.Concurrency = s.Concurrency
 		}
 		cfg.ExportDirectory = s.ExportDirectory
+		// Top-level skip_issue_sync applies to every shape (#299).
+		// The field name matches the MigrateConfig field one-for-one
+		// so there's no inversion.
+		if s.SkipIssueSync != nil && s.SkipIssueSync.Set {
+			cfg.SkipIssueSync = s.SkipIssueSync.Value
+		}
+		if s.SkipProjectDataMigration != nil && s.SkipProjectDataMigration.Set {
+			cfg.SkipProjectDataMigration = s.SkipProjectDataMigration.Value
+		}
 		return cfg
 	case s.SonarCloud != nil:
-		return s.SonarCloud.toMigrateConfig(s.Settings)
+		cfg := s.SonarCloud.toMigrateConfig(s.Settings)
+		if s.SkipIssueSync != nil && s.SkipIssueSync.Set {
+			cfg.SkipIssueSync = s.SkipIssueSync.Value
+		}
+		if s.SkipProjectDataMigration != nil && s.SkipProjectDataMigration.Set {
+			cfg.SkipProjectDataMigration = s.SkipProjectDataMigration.Value
+		}
+		return cfg
 	case s.Migrate != nil:
-		return s.Migrate.toMigrateConfig()
+		cfg := s.Migrate.toMigrateConfig()
+		// Outer-level skip_issue_sync wins when both outer and inner
+		// set it (#299). If only outer is set, propagate it down.
+		if s.SkipIssueSync != nil && s.SkipIssueSync.Set {
+			cfg.SkipIssueSync = s.SkipIssueSync.Value
+		}
+		if s.SkipProjectDataMigration != nil && s.SkipProjectDataMigration.Set {
+			cfg.SkipProjectDataMigration = s.SkipProjectDataMigration.Value
+		}
+		return cfg
 	default:
-		return MigrateConfig{
+		cfg := MigrateConfig{
 			Token:              s.Token,
 			EnterpriseKey:      s.EnterpriseKey,
 			URL:                s.URL,
@@ -163,9 +207,17 @@ func (s configFileShape) toMigrateConfig() MigrateConfig {
 			RunID:              s.RunID,
 			TargetTask:         s.TargetTask,
 			SkipProfiles:       s.SkipProfiles,
-			IncludeScanHistory: s.IncludeScanHistory,
+			IncludeProjectData: s.IncludeProjectData,
 			Debug:              s.Debug,
+			ExcludeBranches:    s.ExcludeBranches,
 		}
+		if s.SkipIssueSync != nil && s.SkipIssueSync.Set {
+			cfg.SkipIssueSync = s.SkipIssueSync.Value
+		}
+		if s.SkipProjectDataMigration != nil && s.SkipProjectDataMigration.Set {
+			cfg.SkipProjectDataMigration = s.SkipProjectDataMigration.Value
+		}
+		return cfg
 	}
 }
 

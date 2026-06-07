@@ -1,0 +1,21 @@
+{
+  "concurrency": 10,
+  "timeout": 60,
+  "export_directory": "./migration-files",
+  "skip_issue_sync": false,
+  "skip_project_data_migration": false,
+  "project_key": "my-project-key",
+  "source": {
+    "url": "https://sonarqube.example.com",
+    "token": "sqp_YOUR_SONARQUBE_SERVER_TOKEN",
+    "pem_file_path": null,
+    "key_file_path": null,
+    "cert_password": null
+  },
+  "target": {
+    "url": "https://sonarcloud.io/",
+    "token": "YOUR_SONARCLOUD_TOKEN",
+    "default_organization": "my-org",
+    "enterprise_key": "my-enterprise"
+  }
+}

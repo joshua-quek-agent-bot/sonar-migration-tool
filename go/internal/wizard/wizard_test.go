@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package wizard
 
 import (
@@ -345,7 +349,7 @@ func TestRunFreshStartFailsOnExtract(t *testing.T) {
 		URLResponses:      []string{testServerURLSlash},
 		PasswordResponses: []string{"token123"},
 		ReviewResponses:   []bool{true},
-		ConfirmResponses:  []bool{false, false, false}, // scan history: no, retry: no, restart: no
+		ConfirmResponses:  []bool{false, false, false}, // project data: no, retry: no, restart: no
 	}
 
 	err := Run(context.Background(), p, dir)

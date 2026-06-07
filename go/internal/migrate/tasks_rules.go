@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package migrate
 
 import (
@@ -28,7 +32,7 @@ func ruleTasks() []TaskDef {
 func runUpdateRuleTags(ctx context.Context, e *Executor) error {
 	orgKeys := buildServerOrgLookup(e)
 
-	counter := NewTaskCounter("updateRuleTags")
+	counter := TaskCounterFromContext(ctx)
 	err := forEachExtractItem(ctx, e, "updateRuleTags", "getRuleDetails",
 		func(ctx context.Context, item structure.ExtractItem, w *common.ChunkWriter) error {
 			ruleKey := extractField(item.Data, "key")
@@ -52,14 +56,13 @@ func runUpdateRuleTags(ctx context.Context, e *Executor) error {
 			_ = w.WriteOne(item.Data)
 			return nil
 		})
-	counter.LogSummary(e.Logger)
 	return err
 }
 
 func runUpdateRuleDescriptions(ctx context.Context, e *Executor) error {
 	orgKeys := buildServerOrgLookup(e)
 
-	counter := NewTaskCounter("updateRuleDescriptions")
+	counter := TaskCounterFromContext(ctx)
 	err := forEachExtractItem(ctx, e, "updateRuleDescriptions", "getRuleDetails",
 		func(ctx context.Context, item structure.ExtractItem, w *common.ChunkWriter) error {
 			ruleKey := extractField(item.Data, "key")
@@ -83,6 +86,5 @@ func runUpdateRuleDescriptions(ctx context.Context, e *Executor) error {
 			_ = w.WriteOne(item.Data)
 			return nil
 		})
-	counter.LogSummary(e.Logger)
 	return err
 }

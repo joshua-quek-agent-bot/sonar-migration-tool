@@ -142,10 +142,10 @@ sonar-migration-tool reset <TOKEN> <ENTERPRISE_KEY> --export_directory ./files/
 
 ---
 
-## CE Task "Issue whilst processing the report" (importScanHistory)
+## CE Task "Issue whilst processing the report" (importProjectData)
 <!-- updated: 2026-06-04_01:14:00.000 by Claude -->
 
-When `importScanHistory` CE tasks fail on SonarCloud with "There was an issue whilst processing the report", the following causes have been identified:
+When `importProjectData` CE tasks fail on SonarCloud with "There was an issue whilst processing the report", the following causes have been identified:
 
 ### ROOT CAUSE: Go ZIP Data Descriptors (FIXED)
 <!-- updated: 2026-06-04_01:14:00.000 by Claude -->
@@ -169,7 +169,7 @@ When `importScanHistory` CE tasks fail on SonarCloud with "There was an issue wh
 
 These differences have been investigated. They do NOT cause CE processing failures but represent areas of reduced fidelity:
 
-1. **Component filtering**: Our code filters to only include components WITH source code (`filterComponentsWithSource` in `tasks_scanhistory.go`). CloudVoyager includes ALL FIL components even without source. If many components lack source, this could produce a much smaller component set.
+1. **Component filtering**: Our code filters to only include components WITH source code (`filterComponentsWithSource` in `tasks_projectdata.go`). CloudVoyager includes ALL FIL components even without source. If many components lack source, this could produce a much smaller component set.
 
 2. **ActiveRule fields**: Our `BuildActiveRules` only sets `RuleRepo`, `RuleKey`, `Severity`, and `QProfileKey`. CloudVoyager also sets `ParamsByKey`, `CreatedAt`, `UpdatedAt`, and `Impacts`. Our proto schema supports all these fields but we don't populate them.
 
@@ -186,7 +186,7 @@ These differences have been investigated. They do NOT cause CE processing failur
 
 **Root cause**: The migration tool was using the SQ branch name (`main`) in the protobuf metadata and CE submit, but the SC project's main branch was named `master`.
 
-**Fix**: Added CloudVoyager-pattern branch name mapping in `tasks_scanhistory.go`:
+**Fix**: Added CloudVoyager-pattern branch name mapping in `tasks_projectdata.go`:
 1. `collectBranchInfo()` now returns `branchInfo` structs with `IsMain` flag (from SQ extracted data)
 2. Before importing, queries SC via `e.Cloud.Branches.List()` to discover the actual SC main branch name
 3. Uses the SC main branch name in the protobuf metadata (`BranchName`) and CE submit (`characteristic=branch=...`), while keeping the SQ branch name for filtering extracted data (issues, components, sources)
@@ -256,6 +256,58 @@ These differences have been investigated. They do NOT cause CE processing failur
 - **Auth method**: `sqco_` tokens require Bearer auth (not Basic). Our `authTransport` correctly uses Bearer.
 - **Metadata fields**: Comprehensive comparison against CloudVoyager's `build-metadata.js` shows all fields match: analysisDate (epoch ms), organizationKey, projectKey, rootComponentRef, branchName, branchType (BRANCH=1), referenceBranchName, scmRevisionId (random 40-char hex), projectVersion ("1.0.0"), qprofilesPerLanguage, analyzedIndexedFileCountPerType.
 - **Protobuf content**: Issue, ExternalIssue, AdHocRule, ActiveRule, Component, and Changesets messages all use correct field numbers per the proto schema. Length-delimited encoding (varint prefix) matches the Java CE parser expectations.
+- **TextRange zero-offset encoding (NOT a rejection cause)**: A decode-diff of `/tmp/reportdiff/cv` (accepted) vs `/tmp/reportdiff/ours` (rejected) showed CV serializes `start_offset=0` explicitly (`18 00`) for 193 external issues, while ours omits field 3 (implicit-presence default). This is **byte-difference only, decode-equivalent, and harmless**. SonarSource's canonical `scanner_report.proto` (verified on `SonarSource/sonarqube` branches 10.6/10.7) is `syntax = "proto3"` with `message TextRange { int32 start_offset = 3; ... }` — plain `int32`, NOT proto2 `optional`. Our `scanner-report.proto:289-294` matches it exactly. Under proto3 implicit presence, the CE's reader cannot distinguish "field absent" from "field present == 0"; `TextRange.getStartOffset()` returns `0` in both cases. Changing our proto to `optional int32` would diverge from the canonical SonarSource schema and change nothing the CE observes. The same-issue side-by-side (ruff/D104) confirmed every other field is byte-identical.
+
+### Measures Files Absent (data-fidelity gap, NOT a rejection cause)
+<!-- updated: 2026-06-05_12:30:00 by Claude -->
+
+The CV report ships 143 `measures-{ref}.pb` files (aggregate metrics: `reliability_rating`, `security_rating`, `sqale_rating`, `ncloc`, `complexity`, `coverage`, `line_coverage`, `cognitive_complexity`, `branch_coverage`, `code_smells`, `sqale_index`, `violations`, plus a few `bugs`/`security_hotspots`/`vulnerabilities`). Our report ships **zero** because `tasks_projectdata.go:310` sets `Measures: make(map[int32][]*pb.Measure)` and never calls `scanreport.BuildMeasures` (the builder exists at `builder.go:306-320` but is unwired). This does **NOT** cause the CE rejection: `ScannerReportReader.readComponentMeasures` guards with `if (fileExists(file))` and returns `emptyCloseableIterator()` when a `measures-N.pb` is missing — missing measures are explicitly tolerated and the CE recomputes aggregates server-side. This is tracked separately as issue #106 / PLAN-FIX-106 (measure fidelity), and is the correct place to wire `BuildMeasures` using the CV `buildMeasures` logic (per-FIL-qualifier component, typed value via int/long/double/string detection).
+- **CV redundant filenames (`externalissues-N.pb` no-dash, `adhoerules.pb` typo)**: CV's known-good zip contains BOTH naming conventions because two CV uploader code paths run (`add-protobuf-files.js` emits the no-dash/typo names; `add-source-and-ext-files.js`/`add-optional-files.js` emit the canonical `external-issues-N.pb`/`adhocrules.pb`). The SonarQube CE `FileStructure.Domain` reads only the canonical hyphenated `external-issues-` and the `adHocRules()` standalone `adhocrules.pb`. The no-dash/typo files are dead weight the CE ignores; ours correctly omits them. Not a difference that matters.
+
+---
+
+## Branch Migration Ordering and Failures
+<!-- updated: 2026-06-05_19:20:00 -->
+
+When `importProjectData` migrates a project with multiple branches, the main branch is imported first (its CE task is awaited) so the project is established, then each **non-main** branch is migrated as a **long-lived branch with its full issue history**. Before uploading a non-main branch's report, the tool performs SonarQube Cloud's "Create analysis" handshake (`POST {api-host}/analysis/analyses`) to register the branch and obtain an analysis id, which it embeds in the report (`metadata.analysis_uuid`) so the CE binds the issues to that branch. Without the handshake the CE accepts the report (task SUCCESS) but never creates the branch.
+
+### Main branch first; non-main branches migrate as long-lived
+
+The tool sorts branches main-first, imports the main branch and waits for CE SUCCESS, then imports each non-main branch (each preceded by the create-analysis handshake). If the main branch CE task fails, the remaining branches are skipped. Every migrated branch is registered as **long-lived** so SonarQube Cloud's automatic pruning of short-lived branches (after ~30 days) never discards migrated history.
+
+**Symptom**: A non-main branch CE task fails with "Invalid branch type 'SHORT'. Branch '\<name\>' already exists with type 'LONG'."
+
+**Cause / fix**: The tool requests `branchType=long` for every migrated branch, so a fresh target avoids this. It can still occur if the **target branch already exists with a conflicting type** from an earlier/partial run — delete that branch on SonarQube Cloud (`POST /api/project_branches/delete?project=<key>&branch=<name>`) and re-run.
+
+**Symptom**: A non-main branch is reported as `skipped: source code not retrievable ...`.
+
+**Cause**: The source server no longer has that branch's source text (purged by housekeeping for an inactive branch — line measures may remain). Re-analyze the branch on the source server to restore its source, then re-run.
+
+### Excluding branches from migration
+
+Use the `--exclude_branches` flag (or `exclude_branches` in the JSON config) to skip specific non-main branches during project data import. This accepts glob patterns compatible with Go's `filepath.Match`:
+
+```bash
+# Exclude all feature branches and release branches
+sonar-migration-tool migrate ... --exclude_branches "feature/*" --exclude_branches "release/*"
+
+# Or in config.json
+{
+  "target": {
+    "exclude_branches": ["feature/*", "release/*"]
+  }
+}
+```
+
+The main branch is **never** excluded, regardless of patterns. See [ADVANCED-CONFIG.md](ADVANCED-CONFIG.md) for the full config reference.
+
+### Resuming after a branch failure
+
+The tool tracks per-branch completion status. When resuming a failed migration with `--run_id`, branches that already succeeded are automatically skipped. Only failed or not-yet-attempted branches are retried.
+
+### Project-level parallelism
+
+Multiple projects are imported in parallel (bounded by concurrency). A failure in one project does not cancel or affect other projects — each project's branches are processed independently.
 
 ---
 

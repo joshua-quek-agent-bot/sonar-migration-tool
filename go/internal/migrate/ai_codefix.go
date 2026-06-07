@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package migrate
 
 import (
@@ -41,7 +45,7 @@ const (
 // aiCodeFixNearPerfectMarker is appended to outcome.Detail when the row
 // should land in the NearPerfect bucket rather than Succeeded. The
 // report collector strips it before display. Mirrors the existing
-// scan-history / NCD-fallback marker convention used for projects.
+// project-data / NCD-fallback marker convention used for projects.
 const aiCodeFixNearPerfectMarker = "|nearperfect"
 
 // AiCodeFixNearPerfectMarker is the exported alias so the predict and

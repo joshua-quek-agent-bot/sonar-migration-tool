@@ -1,3 +1,7 @@
+// Copyright (C) SonarSource Sàrl
+// For more information, see https://sonarsource.com/legal/
+// mailto:info AT sonarsource DOT com
+
 package extract
 
 import (
@@ -15,10 +19,10 @@ import (
 // ACCEPTED value.
 var issueStatusesRename = common.MustParseVersion("10.4")
 
-// scanHistoryTasks returns extract tasks needed for scan history migration.
+// projectDataTasks returns extract tasks needed for project data migration.
 // These tasks extract full issue data, component trees, source code, and SCM
 // blame data — all per-project, per-branch.
-func scanHistoryTasks() []TaskDef {
+func projectDataTasks() []TaskDef {
 	return []TaskDef{
 		{
 			Name:         "getProjectIssuesFull",
@@ -49,6 +53,12 @@ func scanHistoryTasks() []TaskDef {
 			Editions:     AllEditions,
 			Dependencies: []string{"getProjectComponentTree"},
 			Run:          projectSCMDataTask(),
+		},
+		{
+			Name:         "getProjectVersions",
+			Editions:     AllEditions,
+			Dependencies: []string{"getProjects", "getBranches"},
+			Run:          projectVersionsTask(),
 		},
 	}
 }
@@ -281,6 +291,43 @@ func fetchSCMData(ctx context.Context, e *Executor, item json.RawMessage, w *Chu
 	}))
 }
 
+// projectVersionsTask extracts the current project version per branch via
+// /api/navigation/component. This matches how CloudVoyager resolves the
+// source project version for each branch during transfer.
+func projectVersionsTask() func(ctx context.Context, e *Executor) error {
+	return func(ctx context.Context, e *Executor) error {
+		return forEachProjectBranch(ctx, e, "getProjectVersions",
+			func(ctx context.Context, projectKey, branch string, w *ChunkWriter) error {
+				params := url.Values{
+					"component": {projectKey},
+				}
+				if branch != "" {
+					params.Set("branch", branch)
+				}
+				raw, err := e.Raw.Get(ctx, "api/navigation/component", params)
+				if err != nil {
+					if isNonFatalHTTPErr(err) {
+						e.Logger.Debug("getProjectVersions skipped", "project", projectKey, "branch", branch, "err", err)
+						return nil
+					}
+					return err
+				}
+				version := extractField(raw, "version")
+				record := map[string]any{
+					"projectKey": projectKey,
+					"branch":     branch,
+					"version":    version,
+					"serverUrl":  e.ServerURL,
+				}
+				b, err := json.Marshal(record)
+				if err != nil {
+					return err
+				}
+				return w.WriteOne(b)
+			})
+	}
+}
+
 // forEachProjectBranch iterates over all projects and their branches,
 // calling fn for each project+branch combination.
 func forEachProjectBranch(ctx context.Context, e *Executor, taskName string,
@@ -302,14 +349,30 @@ func forEachProjectBranch(ctx context.Context, e *Executor, taskName string,
 		return err
 	}
 
+	// Filter once to know how many projects we'll actually process —
+	// projects with no key or marked skipped (e.g. permissions denied
+	// earlier in the extract) don't count toward the progress total.
+	var keys []string
 	for _, proj := range projects {
 		projectKey := extractField(proj, "key")
 		if projectKey == "" || e.IsSkipped(projectKey) {
 			continue
 		}
+		keys = append(keys, projectKey)
+	}
+
+	// Progress is counted in projects, not project×branch pairs —
+	// branches per project are sequential (see iterateBranches) and
+	// typically singular, so projects is the right operator-visible
+	// denominator (#340).
+	e.Logger.Info("starting task", "task", taskName, "items", len(keys))
+	prog := common.NewProgressLogger(e.Logger, taskName, len(keys))
+
+	for _, projectKey := range keys {
 		if err := iterateBranches(ctx, e, w, taskName, projectKey, branchMap[projectKey], fn); err != nil {
 			return err
 		}
+		prog.Increment()
 	}
 	return nil
 }
