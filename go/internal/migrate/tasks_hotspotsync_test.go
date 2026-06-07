@@ -130,3 +130,93 @@ func TestMapHotspotResolution(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildSourceHotspotLinkURL(t *testing.T) {
+	tests := []struct {
+		name        string
+		serverURL   string
+		serverKey   string
+		hotspotKey  string
+		wantContain string
+	}{
+		{
+			name:        "basic URL",
+			serverURL:   "https://sonar.example.com",
+			serverKey:   "my-project",
+			hotspotKey:  "AX-456",
+			wantContain: "/security_hotspots?id=my-project&hotspots=AX-456",
+		},
+		{
+			name:        "trailing slash on serverURL is stripped",
+			serverURL:   "https://sonar.example.com/",
+			serverKey:   "my-project",
+			hotspotKey:  "AX-456",
+			wantContain: "https://sonar.example.com/security_hotspots",
+		},
+		{
+			name:        "special chars in keys are URL-escaped",
+			serverURL:   "https://sonar.example.com",
+			serverKey:   "my project/with spaces",
+			hotspotKey:  "AX 2",
+			wantContain: "id=my+project%2Fwith+spaces&hotspots=AX+2",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildSourceHotspotLinkURL(tc.serverURL, tc.serverKey, tc.hotspotKey)
+			if !contains(got, tc.wantContain) {
+				t.Errorf("buildSourceHotspotLinkURL(%q, %q, %q) = %q, want substring %q",
+					tc.serverURL, tc.serverKey, tc.hotspotKey, got, tc.wantContain)
+			}
+		})
+	}
+}
+
+func TestHasSourceLinkComment(t *testing.T) {
+	tests := []struct {
+		name          string
+		prefix        string
+		cloudComments []hotspotComment
+		want          bool
+	}{
+		{
+			name:          "no cloud comments",
+			prefix:        "Link to [Original hotspot](",
+			cloudComments: nil,
+			want:          false,
+		},
+		{
+			name:   "matching prefix present",
+			prefix: "Link to [Original hotspot](",
+			cloudComments: []hotspotComment{
+				{Markdown: "Link to [Original hotspot](https://sonar.example.com/security_hotspots?id=p&hotspots=AX-1)"},
+			},
+			want: true,
+		},
+		{
+			name:   "issue prefix does not match hotspot prefix",
+			prefix: "Link to [Original hotspot](",
+			cloudComments: []hotspotComment{
+				{Markdown: "Link to [Original issue](https://x)"},
+			},
+			want: false,
+		},
+		{
+			name:   "unrelated comment does not match",
+			prefix: "Link to [Original hotspot](",
+			cloudComments: []hotspotComment{
+				{Markdown: "[Migrated from SonarQube]\n\nplease review"},
+			},
+			want: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := hasSourceLinkComment(tc.prefix, tc.cloudComments)
+			if got != tc.want {
+				t.Errorf("hasSourceLinkComment(%q, ...) = %v, want %v",
+					tc.prefix, got, tc.want)
+			}
+		})
+	}
+}

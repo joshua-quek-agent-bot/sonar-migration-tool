@@ -375,7 +375,7 @@ func syncProjectIssues(ctx context.Context, e *Executor, cloudKey, orgKey, serve
 			if gctx.Err() != nil {
 				return gctx.Err()
 			}
-			syncOnePair(gctx, e, pair, counter)
+			syncOnePair(gctx, e, pair, counter, serverURL, serverKey)
 			return nil
 		})
 	}
@@ -396,7 +396,11 @@ func syncProjectIssues(ctx context.Context, e *Executor, cloudKey, orgKey, serve
 //
 // Idempotency: if the cloud issue already carries the metadataSyncTag
 // the pair is skipped entirely.
-func syncOnePair(ctx context.Context, e *Executor, pair issuePair, counter *TaskCounter) {
+//
+// serverURL and serverKey are the source SonarQube Server endpoint and
+// project key, used to build a deep-link comment back to the source
+// issue (see #321).
+func syncOnePair(ctx context.Context, e *Executor, pair issuePair, counter *TaskCounter, serverURL, serverKey string) {
 	if slices.Contains(pair.cloud.Tags, metadataSyncTag) {
 		return
 	}
@@ -405,8 +409,9 @@ func syncOnePair(ctx context.Context, e *Executor, pair issuePair, counter *Task
 	transFailed := syncIssueTransition(ctx, e, cloudKey, pair.source)
 	commentFailed := syncIssueComments(ctx, e, cloudKey, pair.source.Comments, pair.cloud.Comments)
 	tagsFailed := syncIssueTags(ctx, e, cloudKey, pair.source.Tags)
+	linkFailed := syncIssueSourceLinkComment(ctx, e, cloudKey, pair.cloud.Comments, serverURL, serverKey, pair.source.Key)
 
-	if transFailed || commentFailed || tagsFailed {
+	if transFailed || commentFailed || tagsFailed || linkFailed {
 		counter.Fail()
 	} else {
 		counter.Success()
@@ -434,6 +439,12 @@ func syncIssueTransition(ctx context.Context, e *Executor, cloudKey string, src 
 // migratedIssueCommentPrefix is the marker prepended to every migrated issue comment.
 // Its presence in a Cloud comment indicates that comment was already migrated.
 const migratedIssueCommentPrefix = "[Migrated from"
+
+// sourceLinkIssueCommentPrefix is the marker prepended to the source-link
+// comment posted at the end of every issue migration. The check against
+// this prefix makes the post idempotent — re-running the task does not
+// create duplicate link comments. See issue #321.
+const sourceLinkIssueCommentPrefix = "Link to [Original issue]("
 
 // syncIssueComments migrates all source comments to the Cloud issue.
 // Skips comments that are already present (idempotency via prefix match).
@@ -468,6 +479,49 @@ func syncIssueComments(ctx context.Context, e *Executor, cloudKey string, source
 	return failed
 }
 
+// syncIssueSourceLinkComment posts a final comment on the Cloud issue that
+// deep-links back to the original SonarQube Server issue, so reviewers on
+// Cloud can find the source of truth in one click. Idempotent: if a
+// comment beginning with the sourceLinkIssueCommentPrefix already exists,
+// no new comment is posted.
+//
+// Returns true if the API call failed (non-fatal — comment link is
+// informational, not data).
+func syncIssueSourceLinkComment(ctx context.Context, e *Executor, cloudKey string, cloudComments []issueComment, serverURL, serverKey, sourceIssueKey string) bool {
+	if serverURL == "" || serverKey == "" || sourceIssueKey == "" {
+		return false
+	}
+	if isAlreadyMigratedSourceLinkComment(sourceLinkIssueCommentPrefix, cloudComments) {
+		return false
+	}
+	url := buildSourceIssueLinkURL(serverURL, serverKey, sourceIssueKey)
+	text := fmt.Sprintf("Link to [Original issue](%s)", url)
+	if err := e.Cloud.Issues.AddComment(ctx, cloudKey, text); err != nil {
+		logAPIWarn(e.Logger, "syncIssueMetadata: source-link comment failed", err,
+			"issue", cloudKey, "url", url)
+		return true
+	}
+	e.Logger.Debug("syncIssueMetadata: source-link comment posted",
+		"issue", cloudKey, "url", url)
+	return false
+}
+
+// buildSourceIssueLinkURL constructs the SonarQube Server deep-link URL for
+// a given issue. Format:
+//   ${serverURL}/project/issues?id=${serverProjectKey}&issues=${issueKey}&open=${issueKey}
+//
+// This is the canonical "open this issue" link in SQS — both `issues` and
+// `open` query parameters are needed so the issue is both listed AND
+// auto-opened in the right-hand panel.
+func buildSourceIssueLinkURL(serverURL, serverKey, issueKey string) string {
+	return fmt.Sprintf("%s/project/issues?id=%s&issues=%s&open=%s",
+		strings.TrimRight(serverURL, "/"),
+		url.QueryEscape(serverKey),
+		url.QueryEscape(issueKey),
+		url.QueryEscape(issueKey),
+	)
+}
+
 // isAlreadyMigratedIssueComment returns true when a migrated comment containing
 // body already exists in the Cloud issue's comment list, preventing duplicates on re-run.
 // Mirrors the hotspot pattern: checks for the migration prefix AND the original body text.
@@ -478,6 +532,23 @@ func isAlreadyMigratedIssueComment(body string, cloudComments []issueComment) bo
 			ccText = cc.HTMLText
 		}
 		if strings.Contains(ccText, migratedIssueCommentPrefix) && strings.Contains(ccText, body) {
+			return true
+		}
+	}
+	return false
+}
+
+// isAlreadyMigratedSourceLinkComment returns true when a comment beginning
+// with prefix (the source-link marker) is already present in the Cloud
+// issue/hotspot comment list. Shared between issue and hotspot flows —
+// the comment format differs but the idempotency check is identical.
+func isAlreadyMigratedSourceLinkComment(prefix string, cloudComments []issueComment) bool {
+	for _, cc := range cloudComments {
+		ccText := cc.Markdown
+		if ccText == "" {
+			ccText = cc.HTMLText
+		}
+		if strings.HasPrefix(ccText, prefix) {
 			return true
 		}
 	}

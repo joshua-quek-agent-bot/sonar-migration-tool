@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -268,7 +269,7 @@ func syncProjectHotspots(ctx context.Context, e *Executor, input syncHotspotInpu
 			if gctx.Err() != nil {
 				return nil
 			}
-			if err := syncOneHotspot(gctx, e, pair, &acknowledged, &unknownRes); err != nil {
+			if err := syncOneHotspot(gctx, e, pair, &acknowledged, &unknownRes, input.ServerURL, input.ServerKey); err != nil {
 				counter.Fail()
 				logAPIWarn(e.Logger, "syncHotspotMetadata: hotspot sync failed", err,
 					"source_key", pair.source.Key, "cloud_key", pair.cloud.Key)
@@ -350,7 +351,11 @@ func buildHotspotPairs(ctx context.Context, e *Executor, input syncHotspotInput)
 // hotspots downgraded to SAFE) and resolution-mapping gaps (e.g. an
 // unrecognised future SQS resolution). They are atomic because
 // syncOneHotspot is invoked from many goroutines.
-func syncOneHotspot(ctx context.Context, e *Executor, pair hotspotPair, acknowledged, unknownRes *atomic.Int64) error {
+//
+// serverURL and serverKey are the source SonarQube Server endpoint and
+// project key, used to build a deep-link comment back to the source
+// hotspot (see #321).
+func syncOneHotspot(ctx context.Context, e *Executor, pair hotspotPair, acknowledged, unknownRes *atomic.Int64, serverURL, serverKey string) error {
 	// 1. Sync status: if source is REVIEWED, change Cloud hotspot status.
 	if strings.ToUpper(pair.source.Status) == "REVIEWED" {
 		res := mapHotspotResolution(pair.source.Resolution)
@@ -375,6 +380,10 @@ func syncOneHotspot(ctx context.Context, e *Executor, pair hotspotPair, acknowle
 
 	// 2. Sync comments: fetch Cloud detail first for idempotency check.
 	if len(pair.source.Comments) == 0 {
+		// No source comments to migrate. Still post the source-link
+		// comment if the URL fields are populated; fetch the Cloud
+		// hotspot's current comments for the idempotency check.
+		_ = syncHotspotSourceLinkComment(ctx, e, pair.cloud.Key, fetchCloudHotspotComments(ctx, e, pair.cloud.Key), serverURL, serverKey, pair.source.Key)
 		return nil
 	}
 
@@ -403,6 +412,10 @@ func syncOneHotspot(ctx context.Context, e *Executor, pair hotspotPair, acknowle
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
+
+	// 3. Post the source-link comment (idempotent). Non-fatal — failure is
+	// logged but does not fail the whole hotspot sync. See issue #321.
+	_ = syncHotspotSourceLinkComment(ctx, e, pair.cloud.Key, cloudComments, serverURL, serverKey, pair.source.Key)
 
 	return nil
 }
@@ -476,6 +489,66 @@ func isAlreadyMigratedComment(source hotspotComment, cloudComments []hotspotComm
 			ccText = cc.HTMLText
 		}
 		if strings.Contains(ccText, migratedCommentPrefix) && strings.Contains(ccText, body) {
+			return true
+		}
+	}
+	return false
+}
+
+// sourceLinkHotspotCommentPrefix is the marker prepended to the source-link
+// comment posted at the end of every hotspot migration. The check against
+// this prefix makes the post idempotent — re-running the task does not
+// create duplicate link comments. See issue #321.
+const sourceLinkHotspotCommentPrefix = "Link to [Original hotspot]("
+
+// syncHotspotSourceLinkComment posts a final comment on the Cloud hotspot
+// that deep-links back to the original SonarQube Server hotspot, so
+// reviewers on Cloud can find the source of truth in one click.
+// Idempotent: if a comment beginning with the source-link prefix already
+// exists, no new comment is posted.
+//
+// Non-fatal: returns true on API failure (logged inside).
+func syncHotspotSourceLinkComment(ctx context.Context, e *Executor, cloudKey string, cloudComments []hotspotComment, serverURL, serverKey, sourceHotspotKey string) bool {
+	if serverURL == "" || serverKey == "" || sourceHotspotKey == "" {
+		return false
+	}
+	if hasSourceLinkComment(sourceLinkHotspotCommentPrefix, cloudComments) {
+		return false
+	}
+	url := buildSourceHotspotLinkURL(serverURL, serverKey, sourceHotspotKey)
+	text := fmt.Sprintf("Link to [Original hotspot](%s)", url)
+	if err := e.Cloud.Hotspots.AddComment(ctx, cloudKey, text); err != nil {
+		logAPIWarn(e.Logger, "syncHotspotMetadata: source-link comment failed", err,
+			"hotspot", cloudKey, "url", url)
+		return true
+	}
+	e.Logger.Debug("syncHotspotMetadata: source-link comment posted",
+		"hotspot", cloudKey, "url", url)
+	return false
+}
+
+// buildSourceHotspotLinkURL constructs the SonarQube Server deep-link URL
+// for a given hotspot. Format:
+//   ${serverURL}/security_hotspots?id=${serverProjectKey}&hotspots=${hotspotKey}
+func buildSourceHotspotLinkURL(serverURL, serverKey, hotspotKey string) string {
+	return fmt.Sprintf("%s/security_hotspots?id=%s&hotspots=%s",
+		strings.TrimRight(serverURL, "/"),
+		url.QueryEscape(serverKey),
+		url.QueryEscape(hotspotKey),
+	)
+}
+
+// hasSourceLinkComment returns true when a comment beginning with prefix
+// (the source-link marker) is already present in the Cloud hotspot
+// comment list. Mirrors isAlreadyMigratedSourceLinkComment in the issue
+// flow but operates on hotspot comments.
+func hasSourceLinkComment(prefix string, cloudComments []hotspotComment) bool {
+	for _, cc := range cloudComments {
+		ccText := cc.Markdown
+		if ccText == "" {
+			ccText = cc.HTMLText
+		}
+		if strings.HasPrefix(ccText, prefix) {
 			return true
 		}
 	}
